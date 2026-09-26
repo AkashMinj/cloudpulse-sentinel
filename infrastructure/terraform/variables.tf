@@ -9,3 +9,15 @@ variable "availability_zones" {
   type        = list(string)
   default     = ["us-east-1a", "us-east-1b"]
 }
+
+variable "db_username" {
+  description = "Master username for the CloudPulse PostgreSQL database"
+  type        = string
+  default     = "cloudpulse_admin"
+}
+
+variable "db_password" {
+  description = "Master password for the CloudPulse PostgreSQL database"
+  type        = string
+  sensitive   = true
+}

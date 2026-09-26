@@ -18,3 +18,10 @@ crash.*.log
 # Secrets
 credentials
 secrets/
+
+# Terraform variables / secrets
+*.tfvars
+*.tfvars.json
+
+# Lambda deployment packages
+*.zip
