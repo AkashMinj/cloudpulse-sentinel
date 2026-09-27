@@ -25,3 +25,8 @@ secrets/
 
 # Lambda deployment packages
 *.zip
+
+# Runtime/generated files
+__pycache__/
+*.pyc
+logs/
