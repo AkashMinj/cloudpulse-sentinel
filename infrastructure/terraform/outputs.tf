@@ -31,7 +31,7 @@ output "ec2_instance_id" {
 
 output "ec2_public_ip" {
   description = "CloudPulse Sentinel EC2 public IP"
-  value       = aws_instance.cloudpulse_ec2.public_ip
+  value       = aws_eip.cloudpulse_ec2.public_ip
 }
 
 output "ec2_public_dns" {

@@ -20,3 +20,18 @@ resource "aws_instance" "cloudpulse_ec2" {
     Environment = "development"
   }
 }
+
+resource "aws_eip" "cloudpulse_ec2" {
+  domain = "vpc"
+
+  tags = {
+    Name        = "cloudpulse-ec2-eip"
+    Project     = "CloudPulse Sentinel"
+    Environment = "development"
+  }
+}
+
+resource "aws_eip_association" "cloudpulse_ec2" {
+  instance_id   = aws_instance.cloudpulse_ec2.id
+  allocation_id = aws_eip.cloudpulse_ec2.id
+}
