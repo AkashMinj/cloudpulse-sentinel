@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 
 import psycopg2
 import psutil
-from incident_engine import detect_incidents
-from sqs_publisher import publish_metric_event
+from app.incident_engine import detect_incidents
+from app.sqs_publisher import publish_metric_event
 from fastapi import FastAPI, HTTPException, Query
 
 app = FastAPI(

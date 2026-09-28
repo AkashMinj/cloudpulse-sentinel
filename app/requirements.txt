@@ -2,5 +2,6 @@ fastapi
 uvicorn[standard]
 psycopg2-binary
 psutil
-
 boto3
+pytest
+httpx

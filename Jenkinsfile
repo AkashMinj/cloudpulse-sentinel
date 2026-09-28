@@ -37,7 +37,21 @@ pipeline {
                 '''
             }
         }
+    stage('Run Tests') {
+        steps {
+        sh '''
+                    set -e
 
+                   python3 -m venv .venv
+                    .venv/bin/python -m pip install --upgrade pip
+                .venv/bin/python -m pip install -r app/requirements.txt
+
+                .venv/bin/python -m pytest -q
+
+                  echo "Automated tests passed."
+                  '''
+        }
+    }
         stage('Build Lambda Package') {
             steps {
                 sh '''
