@@ -42,9 +42,13 @@ pipeline {
             steps {
                 sh '''
                     python3 -m venv .venv
+
                     .venv/bin/python -m pip install --upgrade pip
+
                     .venv/bin/pip install -r requirements-dev.txt
-                    .venv/bin/pytest -q
+
+                    PYTHONPATH="$WORKSPACE" \
+                        .venv/bin/pytest -q
                 '''
             }
         }
@@ -160,7 +164,7 @@ pipeline {
                                      exit 0
                                  fi
 
-                                 echo 'Health check attempt $i failed. Retrying...'
+                                 echo 'Health check attempt $i  failed. Retrying...'
                                  sleep 5
                              done
 
