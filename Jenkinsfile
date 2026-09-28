@@ -26,32 +26,49 @@ pipeline {
         }
 
         stage('Validate Python') {
-            steps {
-                sh '''
-                    set -e
-
-                    python3 --version
-                    python3 -m compileall -q app
-
-                    echo "Python validation passed."
-                '''
-            }
-        }
-    stage('Run Tests') {
-        steps {
+            ste
+	stage('Run Tests') {
+    steps {
         sh '''
-                    set -e
+            set -e
 
-                   python3 -m venv .venv
-                    .venv/bin/python -m pip install --upgrade pip
-                .venv/bin/python -m pip install -r app/requirements.txt
+            python3 -m venv .venv
+            .venv/bin/python -m pip install --upgrade pip
+            .venv/bin/python -m pip install -r requirements-dev.txt
 
-                .venv/bin/python -m pytest -q
+            .venv/bin/python -m pytest -q
 
-                  echo "Automated tests passed."
-                  '''
-        }
+            echo "Automated tests passed."
+        '''
     }
+}
+
+stage('Security Audit') {
+    steps {
+        sh '''
+            set -e
+
+            .venv/bin/pip-audit
+
+            echo "Dependency security audit passed."
+        '''
+    }
+}           echo "Automated tests passed."
+        '''
+    }
+}
+
+stage('Security Audit') {
+    steps {
+        sh '''
+            set -e
+
+            .venv/bin/pip-audit
+
+            echo "Dependency security audit passed."
+        '''
+    }
+}
         stage('Build Lambda Package') {
             steps {
                 sh '''
