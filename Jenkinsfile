@@ -89,9 +89,9 @@ pipeline {
         stage('Validate Terraform') {
             steps {
                 sh '''
-                    terraform fmt -check -recursive
-                    terraform init -backend=false
-                    terraform validate
+                    terraform -chdir=infrastructure/terraform fmt -check -recursive
+                    terraform -chdir=infrastructure/terraform init -backend=false
+                    terraform -chdir=infrastructure/terraform validate
                 '''
             }
         }
@@ -164,7 +164,7 @@ pipeline {
                                      exit 0
                                  fi
 
-                                 echo 'Health check attempt $i  failed. Retrying...'
+                                 echo 'Health check attempt $i failed. Retrying...'
                                  sleep 5
                              done
 
