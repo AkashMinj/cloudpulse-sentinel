@@ -42,9 +42,7 @@ pipeline {
             steps {
                 sh '''
                     python3 -m venv .venv
-
                     .venv/bin/python -m pip install --upgrade pip
-
                     .venv/bin/pip install -r requirements-dev.txt
 
                     PYTHONPATH="$WORKSPACE" \
@@ -76,12 +74,19 @@ pipeline {
                             pip install \
                                 -r app/requirements.txt \
                                 -t build/lambda
+
                             cp app/incident_processor_lambda.py build/lambda/
                             cp app/incident_engine.py build/lambda/
                         "
 
                     cd build/lambda
+
                     zip -r ../incident-processor.zip .
+
+                    cp ../incident-processor.zip ../../incident_processor.zip
+
+                    echo "Lambda package created:"
+                    ls -lh ../../incident_processor.zip
                 '''
             }
         }
