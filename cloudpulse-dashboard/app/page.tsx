@@ -139,6 +139,44 @@ export default function Home() {
 
     return () => clearInterval(interval);
   }, []);
+  
+  const healthScore = data
+    ? Math.round(
+        (100 - data.latest_metrics.cpu_usage_percent) * 0.4 +
+          (100 - data.latest_metrics.memory_usage_percent) * 0.35 +
+          (100 - data.latest_metrics.disk_usage_percent) * 0.25
+      )
+    : null;
+
+  const healthStatus =
+    healthScore === null
+      ? "Loading..."
+      : healthScore >= 80
+        ? "Healthy"
+        : healthScore >= 60
+          ? "Degraded"
+          : healthScore >= 40
+            ? "Unhealthy"
+            : "Critical";
+
+  const riskScore = data
+    ? Math.round(
+        data.latest_metrics.cpu_usage_percent * 0.4 +
+          data.latest_metrics.memory_usage_percent * 0.35 +
+          data.latest_metrics.disk_usage_percent * 0.25
+      )
+    : null;
+
+  const riskStatus =
+    riskScore === null
+      ? "Loading..."
+      : riskScore < 30
+        ? "Low Risk"
+        : riskScore < 60
+          ? "Moderate Risk"
+          : riskScore < 80
+            ? "High Risk"
+            : "Critical Risk";
 
   const chartData = history.map((metric) => ({
     time: new Date(metric.timestamp).toLocaleTimeString([], {
@@ -191,6 +229,114 @@ export default function Home() {
             {error}
           </div>
         )}
+        {/* Cloud Health Score */}
+        <div className="mb-6 rounded-xl border border-slate-800 bg-slate-900 p-6">
+          <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <p className="text-sm font-semibold tracking-wider text-slate-400">
+                CLOUD HEALTH SCORE
+              </p>
+              <p className="mt-2 text-sm text-slate-400">
+                Based on current CPU, memory, and disk utilization.
+              </p>
+
+              <div className="mt-5 grid grid-cols-3 gap-4 text-sm">
+                <div>
+                  <p className="text-slate-500">CPU</p>
+                  <p className="mt-1 font-semibold text-cyan-400">
+                    {data ? `${data.latest_metrics.cpu_usage_percent}%` : "--"}
+                  </p>
+                </div>
+
+                <div>
+                  <p className="text-slate-500">Memory</p>
+                  <p className="mt-1 font-semibold text-green-400">
+                    {data ? `${data.latest_metrics.memory_usage_percent}%` : "--"}
+                  </p>
+                </div>
+
+                <div>
+                  <p className="text-slate-500">Disk</p>
+                  <p className="mt-1 font-semibold text-purple-400">
+                    {data ? `${data.latest_metrics.disk_usage_percent}%` : "--"}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="min-w-[150px] text-left sm:text-right">
+              <div className="text-5xl font-bold text-cyan-400">
+                {healthScore !== null ? `${healthScore}/100` : "--"}
+              </div>
+
+              <p className="mt-1 text-sm font-semibold uppercase tracking-wider text-slate-300">
+                {healthStatus}
+              </p>
+            </div>
+          </div>
+
+          <div className="mt-6 h-2 overflow-hidden rounded-full bg-slate-800">
+            <div
+              className="h-full rounded-full bg-cyan-400 transition-all duration-500"
+              style={{ width: `${healthScore ?? 0}%` }}
+            />
+          </div>
+        </div>
+        
+	{/* Incident Risk */}
+        <div className="mb-6 rounded-xl border border-slate-800 bg-slate-900 p-6">
+          <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <p className="text-sm font-semibold tracking-wider text-slate-400">
+                INCIDENT RISK
+              </p>
+              <p className="mt-2 text-sm text-slate-400">
+                Based on current resource utilization.
+              </p>
+
+              <div className="mt-5 grid grid-cols-3 gap-4 text-sm">
+                <div>
+                  <p className="text-slate-500">CPU</p>
+                  <p className="mt-1 font-semibold text-cyan-400">
+                    {data ? `${data.latest_metrics.cpu_usage_percent}%` : "--"}
+                  </p>
+                </div>
+
+                <div>
+                  <p className="text-slate-500">Memory</p>
+                  <p className="mt-1 font-semibold text-green-400">
+                    {data ? `${data.latest_metrics.memory_usage_percent}%` : "--"}
+                  </p>
+                </div>
+
+                <div>
+                  <p className="text-slate-500">Disk</p>
+                  <p className="mt-1 font-semibold text-purple-400">
+                    {data ? `${data.latest_metrics.disk_usage_percent}%` : "--"}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="min-w-[150px] text-left sm:text-right">
+              <div className="text-5xl font-bold text-yellow-400">
+                {riskScore !== null ? `${riskScore}/100` : "--"}
+              </div>
+
+              <p className="mt-1 text-sm font-semibold uppercase tracking-wider text-slate-300">
+                {riskStatus}
+              </p>
+            </div>
+          </div>
+
+          <div className="mt-6 h-2 overflow-hidden rounded-full bg-slate-800">
+            <div
+              className="h-full rounded-full bg-yellow-400 transition-all duration-500"
+              style={{ width: `${riskScore ?? 0}%` }}
+            />
+          </div>
+        </div>
+
 
         {/* Instance Information */}
         <div className="mb-6 rounded-xl border border-slate-800 bg-slate-900 p-5">
