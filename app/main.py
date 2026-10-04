@@ -773,7 +773,10 @@ def dashboard_summary():
                 "cpu_usage_percent": float(latest_metrics[1]),
                 "memory_usage_percent": float(latest_metrics[2]),
                 "disk_usage_percent": float(latest_metrics[3]),
-                "timestamp": latest_metrics[4].isoformat(),
+                "latency_ms": float(latest_metrics[4]) if latest_metrics[4] is not None else None,
+                "error_rate_percent": float(latest_metrics[5]) if latest_metrics[5] is not None else None,
+                "request_rate": float(latest_metrics[6]) if latest_metrics[6] is not None else None,
+                "timestamp": latest_metrics[7].isoformat(),
             },
             "incidents": {
                 "open": open_incidents,
