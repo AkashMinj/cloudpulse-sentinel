@@ -524,7 +524,7 @@ def metrics_history(
                 "latency_ms": float(row[11]) if row[11] is not None else None,
                 "error_rate_percent": float(row[12]) if row[12] is not None else None,
                 "request_rate": float(row[13]) if row[13] is not None else None,
-                "created_at": row[11].isoformat(),
+                "created_at": row[14].isoformat(),
             })
 
         return {
