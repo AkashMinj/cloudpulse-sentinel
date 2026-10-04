@@ -20,6 +20,9 @@ type DashboardData = {
     cpu_usage_percent: number;
     memory_usage_percent: number;
     disk_usage_percent: number;
+    latency_ms: number | null;
+    error_rate_percent: number | null;
+    request_rate: number | null;
     timestamp: string;
   };
   incidents: {
@@ -160,11 +163,51 @@ export default function Home() {
             : "Critical";
 
   const riskScore = data
-    ? Math.round(
-        data.latest_metrics.cpu_usage_percent * 0.4 +
-          data.latest_metrics.memory_usage_percent * 0.35 +
-          data.latest_metrics.disk_usage_percent * 0.25
-      )
+    ? (() => {
+        const metrics = data.latest_metrics;
+
+        const cpuRisk = Math.min(
+          100,
+          Math.max(0, metrics.cpu_usage_percent)
+        );
+
+        const memoryRisk = Math.min(
+          100,
+          Math.max(0, metrics.memory_usage_percent)
+        );
+
+        const latencyRisk =
+          metrics.latency_ms === null
+            ? 0
+            : Math.min(
+                100,
+                Math.max(0, (metrics.latency_ms / 1000) * 100)
+              );
+
+        const errorRateRisk =
+          metrics.error_rate_percent === null
+            ? 0
+            : Math.min(
+                100,
+                Math.max(0, metrics.error_rate_percent * 10)
+              );
+
+        const trafficRisk =
+          metrics.request_rate === null
+            ? 0
+            : Math.min(
+                100,
+                Math.max(0, metrics.request_rate * 100)
+              );
+
+        return Math.round(
+          cpuRisk * 0.25 +
+            memoryRisk * 0.20 +
+            latencyRisk * 0.20 +
+            errorRateRisk * 0.20 +
+            trafficRisk * 0.15
+        );
+      })()
     : null;
 
   const riskStatus =
@@ -237,7 +280,7 @@ export default function Home() {
                 CLOUD HEALTH SCORE
               </p>
               <p className="mt-2 text-sm text-slate-400">
-                Based on current CPU, memory, and disk utilization.
+                Based on CPU, memory, latency, error rate, and traffic behavior.
               </p>
 
               <div className="mt-5 grid grid-cols-3 gap-4 text-sm">
@@ -282,38 +325,67 @@ export default function Home() {
             />
           </div>
         </div>
-        
-	{/* Incident Risk */}
+
+        {/* Incident Risk */}
         <div className="mb-6 rounded-xl border border-slate-800 bg-slate-900 p-6">
           <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
-            <div>
+            <div className="w-full">
               <p className="text-sm font-semibold tracking-wider text-slate-400">
                 INCIDENT RISK
               </p>
+
               <p className="mt-2 text-sm text-slate-400">
-                Based on current resource utilization.
+                Based on CPU, memory, latency, error rate, and traffic behavior.
               </p>
 
-              <div className="mt-5 grid grid-cols-3 gap-4 text-sm">
+              <div className="mt-5 grid grid-cols-2 gap-4 text-sm sm:grid-cols-5">
                 <div>
                   <p className="text-slate-500">CPU</p>
                   <p className="mt-1 font-semibold text-cyan-400">
                     {data ? `${data.latest_metrics.cpu_usage_percent}%` : "--"}
                   </p>
+                  <p className="text-xs text-slate-600">25% weight</p>
                 </div>
 
                 <div>
                   <p className="text-slate-500">Memory</p>
-                  <p className="mt-1 font-semibold text-green-400">
+                  <p className="mt-1 font-semibold text-blue-400">
                     {data ? `${data.latest_metrics.memory_usage_percent}%` : "--"}
                   </p>
+                  <p className="text-xs text-slate-600">20% weight</p>
                 </div>
 
                 <div>
-                  <p className="text-slate-500">Disk</p>
+                  <p className="text-slate-500">Latency</p>
                   <p className="mt-1 font-semibold text-purple-400">
-                    {data ? `${data.latest_metrics.disk_usage_percent}%` : "--"}
+                    {data?.latest_metrics.latency_ms !== null &&
+                    data?.latest_metrics.latency_ms !== undefined
+                      ? `${data.latest_metrics.latency_ms} ms`
+                      : "--"}
                   </p>
+                  <p className="text-xs text-slate-600">20% weight</p>
+                </div>
+
+                <div>
+                  <p className="text-slate-500">Error Rate</p>
+                  <p className="mt-1 font-semibold text-red-400">
+                    {data?.latest_metrics.error_rate_percent !== null &&
+                    data?.latest_metrics.error_rate_percent !== undefined
+                      ? `${data.latest_metrics.error_rate_percent}%`
+                      : "--"}
+                  </p>
+                  <p className="text-xs text-slate-600">20% weight</p>
+                </div>
+
+                <div>
+                  <p className="text-slate-500">Traffic</p>
+                  <p className="mt-1 font-semibold text-yellow-400">
+                    {data?.latest_metrics.request_rate !== null &&
+                    data?.latest_metrics.request_rate !== undefined
+                      ? `${data.latest_metrics.request_rate} req/s`
+                      : "--"}
+                  </p>
+                  <p className="text-xs text-slate-600">15% weight</p>
                 </div>
               </div>
             </div>
@@ -336,7 +408,6 @@ export default function Home() {
             />
           </div>
         </div>
-
 
         {/* Instance Information */}
         <div className="mb-6 rounded-xl border border-slate-800 bg-slate-900 p-5">

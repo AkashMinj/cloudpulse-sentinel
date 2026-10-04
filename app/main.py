@@ -1,5 +1,8 @@
 
 import os
+import time
+from collections import deque
+from threading import Lock
 import urllib.request
 from datetime import datetime, timezone
 
@@ -7,13 +10,83 @@ import psycopg2
 import psutil
 from app.incident_engine import detect_incidents
 from app.sqs_publisher import publish_metric_event
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 
 app = FastAPI(
     title="CloudPulse Sentinel",
     version="0.8.0",
 )
+# Request telemetry
+REQUEST_WINDOW_SECONDS = 300
+_request_lock = Lock()
+_request_events = deque()
 
+
+def record_request(status_code: int, latency_ms: float):
+    now = time.time()
+
+    with _request_lock:
+        _request_events.append((now, status_code, latency_ms))
+
+        cutoff = now - REQUEST_WINDOW_SECONDS
+
+        while _request_events and _request_events[0][0] < cutoff:
+            _request_events.popleft()
+
+
+def get_request_metrics():
+    now = time.time()
+    cutoff = now - REQUEST_WINDOW_SECONDS
+
+    with _request_lock:
+        while _request_events and _request_events[0][0] < cutoff:
+            _request_events.popleft()
+
+        events = list(_request_events)
+
+    if not events:
+        return {
+            "latency_ms": None,
+            "error_rate_percent": 0.0,
+            "request_rate": 0.0,
+        }
+
+    total_requests = len(events)
+    error_requests = sum(
+        1 for _, status_code, _ in events
+        if status_code >= 400
+    )
+
+    average_latency = sum(
+        latency for _, _, latency in events
+    ) / total_requests
+
+    request_rate = total_requests / REQUEST_WINDOW_SECONDS
+
+    return {
+        "latency_ms": round(average_latency, 2),
+        "error_rate_percent": round(
+            (error_requests / total_requests) * 100,
+            2,
+        ),
+        "request_rate": round(request_rate, 4),
+    }
+
+@app.middleware("http")
+async def request_telemetry(request: Request, call_next):
+    start_time = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        record_request(500, latency_ms)
+        raise
+
+    latency_ms = (time.perf_counter() - start_time) * 1000
+    record_request(response.status_code, latency_ms)
+
+    return response
 
 # -------------------------
 # EC2 METADATA FUNCTIONS
@@ -212,6 +285,8 @@ def collect_and_store_metrics():
 
     try:
         metrics = collect_system_metrics()
+        request_metrics = get_request_metrics()
+        metrics.update(request_metrics)
 
         connection = get_db_connection()
         cursor = connection.cursor()
@@ -227,11 +302,15 @@ def collect_and_store_metrics():
                 memory_available_gb,
                 disk_usage_percent,
                 disk_total_gb,
-                disk_free_gb
+                disk_free_gb,
+                latency_ms,
+                error_rate_percent,
+                request_rate
             )
-            VALUES (
+            VALUES(
                 %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s,
+                %s, %s, %s
             )
             RETURNING id;
         """
@@ -249,6 +328,9 @@ def collect_and_store_metrics():
                 metrics["disk_usage_percent"],
                 metrics["disk_total_gb"],
                 metrics["disk_free_gb"],
+                metrics.get("latency_ms"),
+                metrics.get("error_rate_percent"),
+                metrics.get("request_rate"),
             ),
         )
 
@@ -412,6 +494,9 @@ def metrics_history(
                 disk_usage_percent,
                 disk_total_gb,
                 disk_free_gb,
+                latency_ms,
+                error_rate_percent,
+                request_rate,
                 created_at
             FROM system_metrics
             ORDER BY timestamp DESC
@@ -436,6 +521,9 @@ def metrics_history(
                 "disk_usage_percent": float(row[8]),
                 "disk_total_gb": float(row[9]),
                 "disk_free_gb": float(row[10]),
+                "latency_ms": float(row[11]) if row[11] is not None else None,
+                "error_rate_percent": float(row[12]) if row[12] is not None else None,
+                "request_rate": float(row[13]) if row[13] is not None else None,
                 "created_at": row[11].isoformat(),
             })
 
@@ -647,6 +735,9 @@ def dashboard_summary():
                 cpu_usage_percent,
                 memory_usage_percent,
                 disk_usage_percent,
+                latency_ms,
+                error_rate_percent,
+                request_rate,
                 timestamp
             FROM system_metrics
             ORDER BY timestamp DESC
@@ -697,57 +788,6 @@ def dashboard_summary():
         raise HTTPException(
             status_code=503,
             detail="Unable to retrieve dashboard summary",
-        )
-
-    finally:
-        if cursor is not None:
-            cursor.close()
-
-        if connection is not None:
-            connection.close()
-
-@app.get("/api/v1/metrics/history")
-def metrics_history(limit: int = Query(default=20, ge=1, le=200)):
-    connection = None
-    cursor = None
-
-    try:
-        connection = get_db_connection()
-        cursor = connection.cursor()
-
-        query = """
-            SELECT
-                timestamp,
-                cpu_usage_percent,
-                memory_usage_percent,
-                disk_usage_percent
-            FROM system_metrics
-            ORDER BY timestamp DESC
-            LIMIT %s;
-        """
-
-        cursor.execute(query, (limit,))
-        rows = cursor.fetchall()
-
-        metrics = []
-
-        for row in reversed(rows):
-            metrics.append({
-                "timestamp": row[0].isoformat(),
-                "cpu_usage_percent": float(row[1]),
-                "memory_usage_percent": float(row[2]),
-                "disk_usage_percent": float(row[3]),
-            })
-
-        return {
-            "count": len(metrics),
-            "metrics": metrics,
-        }
-
-    except Exception:
-        raise HTTPException(
-            status_code=503,
-            detail="Unable to retrieve metrics history"
         )
 
     finally:
