@@ -20,6 +20,17 @@ CREATE TABLE IF NOT EXISTS system_metrics (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Upgrade existing system_metrics tables with telemetry columns
+ALTER TABLE system_metrics
+    ADD COLUMN IF NOT EXISTS latency_ms DECIMAL(10, 2);
+
+ALTER TABLE system_metrics
+    ADD COLUMN IF NOT EXISTS error_rate_percent DECIMAL(5, 2);
+
+ALTER TABLE system_metrics
+    ADD COLUMN IF NOT EXISTS request_rate DECIMAL(10, 4);
+
+
 CREATE INDEX IF NOT EXISTS idx_system_metrics_timestamp ON system_metrics(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_system_metrics_instance_id ON system_metrics(instance_id);
 
