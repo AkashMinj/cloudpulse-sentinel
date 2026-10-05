@@ -9,4 +9,5 @@ scikit-learn
 numpy
 pyjwt
 passlib[bcrypt]
+bcrypt==4.3.0
 python-multipart
