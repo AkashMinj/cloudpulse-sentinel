@@ -6,3 +6,7 @@ boto3
 pytest
 httpx
 scikit-learn
+numpy
+pyjwt
+passlib[bcrypt]
+python-multipart

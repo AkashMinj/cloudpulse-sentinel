@@ -4,18 +4,32 @@ import time
 from collections import deque
 from threading import Lock
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import psycopg2
 import psutil
 from app.incident_engine import detect_incidents
 from app.sqs_publisher import publish_metric_event
-from fastapi import FastAPI, HTTPException, Query, Request
+from app.incident_replay import IncidentReplay
+from app.ml_anomaly_service import MLAnomalyService
+from app.auth import (
+    authenticate_user,
+    create_access_token,
+    get_current_user,
+    require_auth,
+    require_role,
+    get_password_hash,
+)
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from pydantic import BaseModel
 
 app = FastAPI(
     title="CloudPulse Sentinel",
     version="0.8.0",
 )
+
+# Initialize ML service
+ml_service = MLAnomalyService()
 # Request telemetry
 REQUEST_WINDOW_SECONDS = 300
 _request_lock = Lock()
@@ -415,7 +429,8 @@ def collect_and_store_metrics():
                 VALUES (
                     %s, %s, %s, %s, %s,
                     %s, %s, %s, %s
-                );
+                )
+                RETURNING id;
             """
 
             cursor.execute(
@@ -432,13 +447,73 @@ def collect_and_store_metrics():
                     incident["detected_at"],
                 ),
             )
+
+            incident_id = cursor.fetchone()[0]
+
+            IncidentReplay.record_event(
+                connection,
+                incident_id,
+                "threshold_breach",
+                f"{incident['incident_type']} crossed threshold",
+                {
+                    "metric_value": incident["metric_value"],
+                    "threshold": incident["threshold_value"],
+                },
+            )
+
+            IncidentReplay.record_event(
+                connection,
+                incident_id,
+                "incident_created",
+                f"Incident created: {incident['title']}",
+                {
+                    "severity": incident["severity"],
+                },
+            )
+
+        # ML anomaly detection
+        try:
+            cursor.execute("SAVEPOINT ml_anomaly_detection")
+
+            if ml_service.is_trained:
+                anomaly_result = ml_service.detect_anomaly(
+                    connection,
+                    metrics,
+                    metric_id,
+                )
+
+                if anomaly_result and anomaly_result.is_anomaly:
+                    anomaly_incident_id = ml_service.create_anomaly_incident(
+                        connection,
+                        metrics,
+                        anomaly_result,
+                        metric_id,
+                    )
+
+                    if anomaly_incident_id:
+                        IncidentReplay.record_event(
+                            connection,
+                            anomaly_incident_id,
+                            "ml_anomaly_detected",
+                            (
+                                "ML model detected anomaly with "
+                                f"score {anomaly_result.anomaly_score:.4f}"
+                            ),
+                            {
+                                "anomaly_score": anomaly_result.anomaly_score,
+                                "signals": ml_service.get_anomaly_signals(metrics),
+                            },
+                        )
+
+            cursor.execute("RELEASE SAVEPOINT ml_anomaly_detection")
+
+        except Exception as ml_error:
+            cursor.execute("ROLLBACK TO SAVEPOINT ml_anomaly_detection")
+            cursor.execute("RELEASE SAVEPOINT ml_anomaly_detection")
+            print(f"ML detection error: {ml_error}", flush=True)
+
         connection.commit()
-
-        publish_metric_event({
-            **metrics,
-            "metric_id": metric_id,
-        })
-
+        publish_metric_event(metrics)
         return {
             "status": "success",
             "message": "Metrics collected and stored",
@@ -799,3 +874,17 @@ def dashboard_summary():
 
         if connection is not None:
             connection.close()
+
+# ============================
+# PRIORITY 1 FEATURES
+# ============================
+
+from app.main_extensions import (
+    register_auth_routes,
+    register_incident_replay_routes,
+    register_ml_routes,
+)
+
+register_auth_routes(app, ml_service)
+register_incident_replay_routes(app)
+register_ml_routes(app, ml_service)

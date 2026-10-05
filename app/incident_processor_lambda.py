@@ -3,8 +3,12 @@ import os
 
 import psycopg2
 
-from incident_engine import detect_incidents
-
+try:
+    from incident_engine import detect_incidents
+except ModuleNotFoundError as exc:
+    if exc.name != "incident_engine":
+        raise
+    from app.incident_engine import detect_incidents
 
 def get_db_connection():
     return psycopg2.connect(
