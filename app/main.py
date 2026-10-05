@@ -482,28 +482,78 @@ def collect_and_store_metrics():
                     metric_id,
                 )
 
-                if anomaly_result and anomaly_result.is_anomaly:
-                    anomaly_incident_id = ml_service.create_anomaly_incident(
-                        connection,
-                        metrics,
-                        anomaly_result,
-                        metric_id,
-                    )
-
-                    if anomaly_incident_id:
-                        IncidentReplay.record_event(
+                if anomaly_result:
+                    if anomaly_result.is_anomaly:
+                        anomaly_incident_id = ml_service.create_anomaly_incident(
                             connection,
-                            anomaly_incident_id,
-                            "ml_anomaly_detected",
-                            (
-                                "ML model detected anomaly with "
-                                f"score {anomaly_result.anomaly_score:.4f}"
-                            ),
-                            {
-                                "anomaly_score": anomaly_result.anomaly_score,
-                                "signals": ml_service.get_anomaly_signals(metrics),
-                            },
+                            metrics,
+                            anomaly_result,
+                            metric_id,
                         )
+
+                        if anomaly_incident_id:
+                            if anomaly_result.anomaly_score >= -0.3:
+                                ml_severity = "info"
+                            elif anomaly_result.anomaly_score >= -0.5:
+                                ml_severity = "warning"
+                            else:
+                                ml_severity = "critical"
+
+                            IncidentReplay.record_event(
+                                connection,
+                                anomaly_incident_id,
+                                "incident_created",
+                                "ML anomaly incident created",
+                                {
+                                    "severity": ml_severity,
+                                    "metric_id": metric_id,
+                                },
+                            )
+
+                            IncidentReplay.record_event(
+                                connection,
+                                anomaly_incident_id,
+                                "ml_anomaly_detected",
+                                (
+                                    "ML model detected anomaly with "
+                                    f"score {anomaly_result.anomaly_score:.4f}"
+                                ),
+                                {
+                                    "anomaly_score": anomaly_result.anomaly_score,
+                                    "signals": ml_service.get_anomaly_signals(
+                                        metrics
+                                    ),
+                                },
+                            )
+
+                    else:
+                        cursor.execute(
+                            """
+                            UPDATE incidents
+                            SET
+                                status = 'resolved',
+                                resolved_at = CURRENT_TIMESTAMP
+                            WHERE instance_id = %s
+                              AND incident_type = 'ml_anomaly'
+                              AND status = 'open'
+                            RETURNING id;
+                            """,
+                            (metrics["instance_id"],),
+                        )
+
+                        resolved_incidents = cursor.fetchall()
+
+                        for (resolved_incident_id,) in resolved_incidents:
+                            IncidentReplay.record_event(
+                                connection,
+                                resolved_incident_id,
+                                "incident_resolved",
+                                "ML anomaly returned to normal",
+                                {
+                                    "metric_id": metric_id,
+                                    "anomaly_score": anomaly_result.anomaly_score,
+                                },
+                            )
 
             cursor.execute("RELEASE SAVEPOINT ml_anomaly_detection")
 
