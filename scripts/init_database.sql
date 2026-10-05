@@ -122,7 +122,7 @@ INSERT INTO users (username, email, hashed_password, full_name, role)
 VALUES (
     'admin',
     'admin@cloudpulse.local',
-    '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewY5NU7mjPCCz.Mm',
+    '$2b$12$zH5O0c/JrYR/XcBFIQdaoO0yPuh7RW2hzbHTjbc9AtVLFMkwd.382',
     'Administrator',
     'admin'
 )
@@ -133,7 +133,7 @@ INSERT INTO users (username, email, hashed_password, full_name, role)
 VALUES (
     'analyst',
     'analyst@cloudpulse.local',
-    '$2b$12$EixZX0fxXQXj9LrJqVJtWOcF2PYWdOjHxGTJkVpqBLUx.5BM/LQky',
+    '$2b$12$kcYW93Pd.VMn.BeFtoEd8.iyssS4aiFl1egbAB3w5uM/A1bTJlsEK',
     'Operations Analyst',
     'analyst'
 )
