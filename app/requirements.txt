@@ -5,3 +5,4 @@ psutil
 boto3
 pytest
 httpx
+scikit-learn
