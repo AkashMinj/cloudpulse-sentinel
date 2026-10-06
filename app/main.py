@@ -885,6 +885,19 @@ def dashboard_summary():
         """)
 
         total_incidents = cursor.fetchone()[0]
+        cursor.execute("""
+            SELECT
+                metric_id,
+                is_anomaly,
+                anomaly_score,
+                model_version,
+                detected_at
+            FROM anomaly_detections
+            ORDER BY detected_at DESC
+            LIMIT 1;
+        """)
+
+        latest_anomaly = cursor.fetchone()
 
         if latest_metrics is None:
             raise HTTPException(
@@ -907,6 +920,22 @@ def dashboard_summary():
                 "open": open_incidents,
                 "total": total_incidents,
             },
+            "ml_detection": {
+                "is_trained": ml_service.is_trained,
+                "model_version": ml_service.model_version,
+                "model_type": "IsolationForest",
+                "latest": (
+                    {
+                        "metric_id": latest_anomaly[0],
+                        "is_anomaly": latest_anomaly[1],
+                        "anomaly_score": float(latest_anomaly[2]),
+                        "detected_at": latest_anomaly[4].isoformat(),
+                    }
+                    if latest_anomaly is not None
+                    else None
+                ),
+            },
+
         }
 
     except HTTPException:
