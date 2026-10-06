@@ -8,6 +8,7 @@ import psycopg2
 from psycopg2.extras import Json
 from app.anomaly_detector import ResourceAnomalyDetector, AnomalyResult
 
+ML_INCIDENT_CONFIRMATIONS = 3
 
 class MLAnomalyService:
     """Service for ML-based anomaly detection and integration."""
@@ -213,6 +214,33 @@ class MLAnomalyService:
 
             if cursor.fetchone():
                 return None  # Already have an open anomaly incident
+
+            # Require consecutive anomaly confirmations before creating an incident.
+            confirmation_query = """
+                SELECT metric_id, is_anomaly
+                FROM anomaly_detections
+                WHERE instance_id = %s
+                ORDER BY id DESC
+                LIMIT %s;
+            """
+
+            cursor.execute(
+                confirmation_query,
+                (metrics["instance_id"], ML_INCIDENT_CONFIRMATIONS),
+            )
+
+            detections = cursor.fetchall()
+
+            if len(detections) < ML_INCIDENT_CONFIRMATIONS:
+                return None
+
+            if not all(detection[1] for detection in detections):
+                return None
+
+            metric_ids = [detection[0] for detection in detections]
+
+            if any(metric_ids[i] != metric_ids[i + 1] - 1 for i in range(len(metric_ids) - 1)):
+                return None
 
             # Create anomaly incident
             signals = self.get_anomaly_signals(metrics)
