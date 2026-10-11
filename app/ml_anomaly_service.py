@@ -7,6 +7,11 @@ from typing import Optional, Dict
 import psycopg2
 from psycopg2.extras import Json
 from app.anomaly_detector import ResourceAnomalyDetector, AnomalyResult
+import os
+import pickle
+
+import boto3
+from botocore.exceptions import ClientError
 
 ML_INCIDENT_CONFIRMATIONS = 3
 
@@ -17,6 +22,58 @@ class MLAnomalyService:
         self.detector = ResourceAnomalyDetector(contamination=0.05, random_state=42)
         self.is_trained = False
         self.model_version = "1.0.0"
+        self.model_bucket = os.getenv("ML_MODEL_BUCKET")
+        self.model_key = "models/isolation-forest.pkl"
+        self.s3_client = boto3.client("s3", region_name="us-east-1")
+
+    def load_model(self) -> bool:
+        """Load the trained detector from S3 if an artifact exists."""
+        if not self.model_bucket:
+            return False
+
+        try:
+            response = self.s3_client.get_object(
+                Bucket=self.model_bucket,
+                Key=self.model_key,
+            )
+            artifact = pickle.loads(response["Body"].read())
+
+            if artifact.get("model_version") != self.model_version:
+                raise ValueError("Saved model version is incompatible.")
+
+            detector = artifact.get("detector")
+            if not isinstance(detector, ResourceAnomalyDetector):
+                raise ValueError("Saved model has an invalid detector.")
+
+            if not detector._trained:
+                raise ValueError("Saved detector is not trained.")
+
+            self.detector = detector
+            self.is_trained = True
+            return True
+
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code")
+            if error_code in ("NoSuchKey", "404", "NotFound"):
+                return False
+            raise
+
+    def _save_model(self, detector) -> None:
+        """Save a trained detector to S3."""
+        if not self.model_bucket:
+            raise RuntimeError("ML_MODEL_BUCKET is not configured.")
+
+        artifact = {
+            "model_version": self.model_version,
+            "detector": detector,
+        }
+
+        self.s3_client.put_object(
+            Bucket=self.model_bucket,
+            Key=self.model_key,
+            Body=pickle.dumps(artifact, protocol=pickle.HIGHEST_PROTOCOL),
+            ContentType="application/octet-stream",
+        )
 
     def train_model(self, connection) -> Dict:
         """
@@ -63,10 +120,18 @@ class MLAnomalyService:
                 for row in rows
             ]
 
-            # Train the model
-            self.detector.fit(metrics)
-            self.is_trained = True
+            # Train a candidate without replacing the active detector.
+            candidate = ResourceAnomalyDetector(
+                contamination=0.05,
+                random_state=42,
+            )
+            candidate.fit(metrics)
 
+            # Persist first; activate only if saving succeeds.
+            self._save_model(candidate)
+
+            self.detector = candidate
+            self.is_trained = True
             return {
                 "status": "success",
                 "message": "Model trained successfully",

@@ -30,6 +30,16 @@ app = FastAPI(
 
 # Initialize ML service
 ml_service = MLAnomalyService()
+@app.on_event("startup")
+async def load_ml_model():
+    try:
+        loaded = ml_service.load_model()
+        if loaded:
+            print("ML model loaded successfully from S3.")
+        else:
+            print("No saved ML model found; training is required.")
+    except Exception as exc:
+        print(f"Failed to load ML model from S3: {exc}")
 # Request telemetry
 REQUEST_WINDOW_SECONDS = 300
 _request_lock = Lock()

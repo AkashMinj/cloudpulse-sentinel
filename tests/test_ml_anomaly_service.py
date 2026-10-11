@@ -7,7 +7,9 @@ from app.ml_anomaly_service import (
     MLAnomalyService,
     ML_INCIDENT_CONFIRMATIONS,
 )
+import pickle
 
+from app.anomaly_detector import ResourceAnomalyDetector
 
 INSTANCE_ID = "i-test-instance"
 
@@ -155,3 +157,107 @@ def test_existing_open_incident_prevents_duplicate():
     )
 
     assert incident_id is None
+
+def test_save_model_uploads_artifact_to_s3():
+    service = MLAnomalyService()
+    service.model_bucket = "test-model-bucket"
+    service.s3_client = Mock()
+
+    detector = ResourceAnomalyDetector()
+    detector.fit(
+        [
+            {
+                "cpu_usage_percent": i,
+                "memory_usage_percent": 50 + i,
+                "disk_usage_percent": 30 + i,
+            }
+            for i in range(20)
+        ]
+    )
+
+    service._save_model(detector)
+
+    kwargs = service.s3_client.put_object.call_args.kwargs
+    assert kwargs["Bucket"] == "test-model-bucket"
+    assert kwargs["Key"] == "models/isolation-forest.pkl"
+
+    artifact = pickle.loads(kwargs["Body"])
+    assert artifact["model_version"] == service.model_version
+    assert isinstance(artifact["detector"], ResourceAnomalyDetector)
+    assert artifact["detector"]._trained
+
+
+def test_load_model_restores_saved_detector():
+    service = MLAnomalyService()
+    service.model_bucket = "test-model-bucket"
+
+    detector = ResourceAnomalyDetector()
+    detector.fit(
+        [
+            {
+                "cpu_usage_percent": i,
+                "memory_usage_percent": 50 + i,
+                "disk_usage_percent": 30 + i,
+            }
+            for i in range(20)
+        ]
+    )
+
+    artifact = pickle.dumps(
+        {
+            "model_version": service.model_version,
+            "detector": detector,
+        }
+    )
+    service.s3_client = Mock()
+    service.s3_client.get_object.return_value = {
+        "Body": Mock(read=Mock(return_value=artifact))
+    }
+
+    assert service.load_model() is True
+    assert service.is_trained is True
+    assert service.detector._trained is True
+
+
+def test_load_model_returns_false_when_artifact_is_missing():
+    from botocore.exceptions import ClientError
+
+    service = MLAnomalyService()
+    service.model_bucket = "test-model-bucket"
+    service.s3_client = Mock()
+    service.s3_client.get_object.side_effect = ClientError(
+        {
+            "Error": {
+                "Code": "NoSuchKey",
+                "Message": "Not found",
+            }
+        },
+        "GetObject",
+    )
+
+    assert service.load_model() is False
+    assert service.is_trained is False
+
+
+def test_training_upload_failure_preserves_active_detector():
+    service = MLAnomalyService()
+    service.model_bucket = "test-model-bucket"
+
+    active_detector = service.detector
+    service.is_trained = False
+    service.s3_client = Mock()
+    service.s3_client.put_object.side_effect = RuntimeError("S3 unavailable")
+
+    connection = FakeConnection(
+        [
+            (20 + i, 50 + i, 30 + i)
+            for i in range(20)
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="S3 unavailable"):
+        service.train_model(connection)
+
+    assert service.detector is active_detector
+    assert service.is_trained is False
+    assert connection.fake_cursor.closed

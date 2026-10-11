@@ -1,5 +1,5 @@
 resource "aws_instance" "cloudpulse_ec2" {
-  ami                         = data.aws_ami.amazon_linux.id
+  ami                         = "ami-0b2c9d1f3edcfd709"
   instance_type               = "t3.micro"
   subnet_id                   = aws_subnet.public_subnet_a.id
   vpc_security_group_ids      = [aws_security_group.cloudpulse_ec2_sg.id]

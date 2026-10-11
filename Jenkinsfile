@@ -146,6 +146,7 @@ pipeline {
                                  --name cloudpulse-backend \
                                  --restart unless-stopped \
                                  --env-file .env \
+				  -e ML_MODEL_BUCKET=cloudpulse-ml-models-306005334008 \
                                  -p 8000:8000 \
                                  cloudpulse-backend:latest
 
