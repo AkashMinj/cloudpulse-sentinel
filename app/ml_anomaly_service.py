@@ -237,11 +237,6 @@ class MLAnomalyService:
             if not all(detection[1] for detection in detections):
                 return None
 
-            metric_ids = [detection[0] for detection in detections]
-
-            if any(metric_ids[i] != metric_ids[i + 1] - 1 for i in range(len(metric_ids) - 1)):
-                return None
-
             # Create anomaly incident
             signals = self.get_anomaly_signals(metrics)
 
