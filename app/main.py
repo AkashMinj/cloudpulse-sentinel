@@ -422,6 +422,64 @@ def collect_and_store_metrics():
             existing_incident = cursor.fetchone()
 
             if existing_incident is not None:
+                existing_incident_id = existing_incident[0]
+
+                cursor.execute(
+                    """
+                    SELECT severity
+                    FROM incidents
+                    WHERE id = %s
+                      AND status = 'open';
+                    """,
+                    (existing_incident_id,),
+                )
+                existing_details = cursor.fetchone()
+
+                if existing_details is not None:
+                    previous_severity = existing_details[0]
+
+                    cursor.execute(
+                        """
+                        UPDATE incidents
+                        SET
+                            metric_id = %s,
+                            severity = %s,
+                            title = %s,
+                            description = %s,
+                            metric_value = %s,
+                            threshold_value = %s
+                        WHERE id = %s
+                          AND status = 'open';
+                        """,
+                        (
+                            metric_id,
+                            incident["severity"],
+                            incident["title"],
+                            incident["description"],
+                            incident["metric_value"],
+                            incident["threshold_value"],
+                            existing_incident_id,
+                        ),
+                    )
+
+                    if previous_severity != incident["severity"]:
+                        IncidentReplay.record_event(
+                            connection,
+                            existing_incident_id,
+                            "incident_severity_changed",
+                            (
+                                f"Incident severity changed from "
+                                f"{previous_severity} to "
+                                f"{incident['severity']}"
+                            ),
+                            {
+                                "previous_severity": previous_severity,
+                                "new_severity": incident["severity"],
+                                "metric_value": incident["metric_value"],
+                                "threshold": incident["threshold_value"],
+                            },
+                        )
+
                 continue
 
             incident_query = """
