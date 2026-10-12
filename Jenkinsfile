@@ -212,7 +212,7 @@ PY
                                      exit 0
                                  fi
 
-                                 echo 'Health check attempt $i failed. Retrying...'
+                                 echo 'Health check attempt \$i failed. Retrying...'
                                  sleep 5
                              done
 
