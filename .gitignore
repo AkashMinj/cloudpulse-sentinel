@@ -36,3 +36,6 @@ logs/
 # Vim swap files
 *.swp
 *.swo
+
+# Local build artifacts
+/build/
