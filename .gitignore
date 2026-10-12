@@ -32,3 +32,7 @@ __pycache__/
 logs/
 
 .venv/
+
+# Vim swap files
+*.swp
+*.swo
