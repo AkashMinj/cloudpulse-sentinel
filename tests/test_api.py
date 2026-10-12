@@ -166,3 +166,57 @@ def test_metrics_collect_database_failure():
     }
 
     mock_connection.rollback.assert_called_once()
+
+def test_metrics_collect_survives_ml_detection_failure():
+    metrics = {
+        "instance_id": "test-instance",
+        "timestamp": datetime.now(timezone.utc),
+        "cpu_usage_percent": 50.0,
+        "cpu_count": 4,
+        "memory_usage_percent": 60.0,
+        "memory_total_gb": 8.0,
+        "memory_available_gb": 3.2,
+        "disk_usage_percent": 40.0,
+        "disk_total_gb": 50.0,
+        "disk_free_gb": 30.0,
+    }
+
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (123,)
+
+    mock_connection = MagicMock()
+    mock_connection.cursor.return_value = mock_cursor
+
+    with patch(
+        "app.main.collect_system_metrics",
+        return_value=metrics,
+    ), patch(
+        "app.main.get_db_connection",
+        return_value=mock_connection,
+    ), patch(
+        "app.main.ml_service.is_trained",
+        True,
+    ), patch(
+        "app.main.ml_service.detect_anomaly",
+        side_effect=RuntimeError("simulated ML failure"),
+    ), patch(
+        "app.main.publish_metric_event",
+    ) as mock_publish:
+
+        response = client.post("/api/v1/metrics/collect")
+
+    assert response.status_code == 200
+    assert response.json()["metric_id"] == 123
+
+    executed_sql = [
+        call.args[0]
+        for call in mock_cursor.execute.call_args_list
+    ]
+
+    assert "SAVEPOINT ml_anomaly_detection" in executed_sql
+    assert "ROLLBACK TO SAVEPOINT ml_anomaly_detection" in executed_sql
+    assert "RELEASE SAVEPOINT ml_anomaly_detection" in executed_sql
+
+    mock_connection.commit.assert_called_once()
+    mock_publish.assert_called_once()
+    mock_connection.close.assert_called_once()
