@@ -140,3 +140,37 @@ def test_detector_separates_held_out_normal_and_extreme_metrics():
 
     assert normal_predictions == [False, False, False]
     assert extreme_predictions == [True, True, True]
+
+@pytest.mark.parametrize(
+    "metric",
+    [
+        make_metric(-1, 40, 30),
+        make_metric(10, 101, 30),
+        make_metric(10, 40, -0.1),
+    ],
+)
+def test_fit_rejects_resource_percentages_out_of_range(metric):
+    detector = ResourceAnomalyDetector()
+
+    with pytest.raises(ValueError, match="between 0 and 100"):
+        detector.fit([metric] * 10)
+
+
+@pytest.mark.parametrize(
+    "metric",
+    [
+        make_metric(-1, 40, 30),
+        make_metric(10, 101, 30),
+        make_metric(10, 40, -0.1),
+    ],
+)
+def test_predict_rejects_resource_percentages_out_of_range(metric):
+    training_data = [
+        make_metric(10 + i % 5, 40 + i % 4, 30 + i % 3)
+        for i in range(20)
+    ]
+    detector = ResourceAnomalyDetector()
+    detector.fit(training_data)
+
+    with pytest.raises(ValueError, match="between 0 and 100"):
+        detector.predict(metric)

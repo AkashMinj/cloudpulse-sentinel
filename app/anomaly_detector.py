@@ -61,7 +61,7 @@ class ResourceAnomalyDetector:
     @staticmethod
     def _to_matrix(metrics: list[dict]) -> np.ndarray:
         try:
-            return np.array(
+            X = np.array(
                 [
                     [float(metric[feature]) for feature in FEATURES]
                     for metric in metrics
@@ -72,3 +72,13 @@ class ResourceAnomalyDetector:
             raise ValueError(
                 "Each metric must contain valid CPU, memory, and disk values."
             ) from exc
+
+        if not np.isfinite(X).all():
+            raise ValueError("Resource percentages must be finite numbers.")
+
+        if ((X < 0) | (X > 100)).any():
+            raise ValueError(
+                "Resource percentages must be between 0 and 100."
+            )
+
+        return X
