@@ -195,30 +195,30 @@ PY
                 }
             }
         }
-
         stage('Health Check') {
             steps {
                 sshagent(credentials: [env.EC2_CREDENTIALS]) {
                     sh '''
                         set -eu
 
+                        for attempt in 1 2 3 4 5; do
+                            if ssh -o StrictHostKeyChecking=yes \
+                                "${EC2_USER}@${EC2_HOST}" \
+                                'curl -fsS http://localhost:8000/health'; then
+                                echo "Health check passed."
+                                exit 0
+                            fi
+
+                            echo "Health check attempt ${attempt} failed. Retrying..."
+                            sleep 5
+                        done
+
                         ssh -o StrictHostKeyChecking=yes \
                             "${EC2_USER}@${EC2_HOST}" \
-                            "set -e
+                            'docker logs --tail 100 cloudpulse-backend' || true
 
-                             for i in 1 2 3 4 5; do
-                                 if curl -fsS http://localhost:8000/health; then
-                                     echo
-                                     exit 0
-                                 fi
-
-                                 echo 'Health check attempt \$i failed. Retrying...'
-                                 sleep 5
-                             done
-
-                             echo 'Health check failed.'
-                             docker logs --tail 100 cloudpulse-backend
-                             exit 1"
+                        echo "Health check failed after 5 attempts."
+                        exit 1
                     '''
                 }
             }
