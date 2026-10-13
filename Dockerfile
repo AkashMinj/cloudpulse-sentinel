@@ -1,6 +1,7 @@
 FROM python:3.12-alpine
 
-RUN apk update && apk upgrade --no-cache
+RUN apk update && apk upgrade --no-cache && \
+    apk add --no-cache build-base gcc g++ gfortran openblas-dev lapack-dev
 
 WORKDIR /app
 
