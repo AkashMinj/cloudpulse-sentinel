@@ -39,3 +39,6 @@ logs/
 
 # Local build artifacts
 /build/
+
+# Local security scan reports
+trivy-*.json
