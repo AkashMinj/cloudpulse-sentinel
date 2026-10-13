@@ -148,17 +148,38 @@ PY
             }
         }
 
+
         stage('Container Security Scan') {
             steps {
                 sh '''
                     set -eu
+                    mkdir -p reports
+
+                    # Preserve the report even when vulnerabilities are found.
                     /usr/bin/trivy image \
+                        --scanners vuln \
                         --severity HIGH,CRITICAL \
+                        --format json \
+                        --output reports/trivy-report.json \
+                        "${DOCKER_IMAGE}"
+
+                    # Fail only on CRITICAL findings.
+                    /usr/bin/trivy image \
+                        --scanners vuln \
+                        --severity CRITICAL \
+                        --exit-code 1 \
+                        "${DOCKER_IMAGE}"
+
+                    # Display HIGH findings for review without blocking.
+                    /usr/bin/trivy image \
+                        --scanners vuln \
+                        --severity HIGH \
                         --exit-code 0 \
                         "${DOCKER_IMAGE}"
                 '''
             }
         }
+
 
         stage('Deploy to EC2') {
             steps {
@@ -236,6 +257,8 @@ PY
 
         always {
             echo "Build #${BUILD_NUMBER} completed."
+            archiveArtifacts artifacts: 'reports/trivy-report.json',
+                             allowEmptyArchive: true
         }
     }
 }
