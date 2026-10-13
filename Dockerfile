@@ -1,13 +1,6 @@
-FROM python:3.12-slim-bookworm
+FROM python:3.12-alpine
 
-RUN apt-get update \
-    && apt-get upgrade -y \
-        util-linux \
-        libacl1 \
-        libncurses6 \
-        libsystemd0 \
-        perl-base \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk update && apk upgrade --no-cache
 
 WORKDIR /app
 
