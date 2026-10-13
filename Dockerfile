@@ -1,4 +1,4 @@
-FROM python:3.12-slim-bookworm@sha256:latest
+FROM python:3.12-slim-bookworm
 
 RUN apt-get update \
     && apt-get upgrade -y \
