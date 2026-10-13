@@ -1,7 +1,12 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm@sha256:latest
 
 RUN apt-get update \
     && apt-get upgrade -y \
+        util-linux \
+        libacl1 \
+        libncurses6 \
+        libsystemd0 \
+        perl-base \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
