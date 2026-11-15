@@ -42,3 +42,13 @@ logs/
 
 # Local security scan reports
 trivy-*.json
+
+# Frontend and generated artifacts
+cloudpulse-dashboard/node_modules/
+cloudpulse-dashboard/.next/
+cloudpulse-dashboard/.env.local
+*.tfplan
+*.zip
+reports/
+*.log
+.DS_Store

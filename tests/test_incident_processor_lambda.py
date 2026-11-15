@@ -23,8 +23,8 @@ def test_incident_uses_metric_id_from_event():
     connection = MagicMock()
     cursor = connection.cursor.return_value
 
-    # No existing open incident.
-    cursor.fetchone.return_value = None
+    # First fetch is the duplicate check; second fetch is INSERT ... RETURNING id.
+    cursor.fetchone.side_effect = [None, (321,)]
 
     with patch(
         "app.incident_processor_lambda.get_db_connection",
@@ -50,6 +50,10 @@ def test_incident_uses_metric_id_from_event():
     assert params[3] == "warning"
     assert params[6] == 85.0
     assert params[7] == 80
+    assert any(
+        "INSERT INTO incident_events" in call.args[0]
+        for call in cursor.execute.call_args_list
+    )
 
 
 def test_no_incident_means_no_database_connection():

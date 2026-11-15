@@ -1,11 +1,15 @@
 pipeline {
     agent any
 
+    parameters {
+        booleanParam(name: 'DEPLOY_TO_EC2', defaultValue: false, description: 'Deploy the backend to EC2 after validation and security scanning.')
+        string(name: 'EC2_HOST', defaultValue: '', description: 'EC2 public DNS name or IP. Required only when deployment is enabled.')
+        string(name: 'EC2_USER', defaultValue: 'ec2-user', description: 'SSH user for the deployment host.')
+        string(name: 'EC2_PROJECT_DIR', defaultValue: '/home/ec2-user/cloudpulse-sentinel', description: 'Remote directory containing the deployment .env file.')
+        string(name: 'EC2_CREDENTIALS_ID', defaultValue: 'cloudpulse-ec2-ssh', description: 'Jenkins SSH credential ID.')
+    }
+
     environment {
-        EC2_HOST = '18.214.224.132'
-        EC2_USER = 'ec2-user'
-        EC2_PROJECT_DIR = '/home/ec2-user/cloudpulse-sentinel'
-        EC2_CREDENTIALS = 'cloudpulse-ec2-ssh'
         DOCKER_IMAGE = "cloudpulse-backend:ci-${BUILD_NUMBER}"
     }
 
@@ -137,6 +141,20 @@ PY
             }
         }
 
+
+        stage('Dashboard Checks') {
+            steps {
+                sh '''
+                    set -eu
+                    docker run --rm \
+                        -v "$PWD/cloudpulse-dashboard:/workspace" \
+                        -w /workspace \
+                        node:22-alpine \
+                        sh -c "npm ci && npm run lint && npm run build"
+                '''
+            }
+        }
+
         stage('Docker Build') {
             steps {
                 sh '''
@@ -181,66 +199,82 @@ PY
         }
 
 
-        stage('Deploy to EC2') {
+        stage('Deploy Backend to EC2') {
+            when {
+                expression { params.DEPLOY_TO_EC2 }
+            }
             steps {
-                sshagent(credentials: [env.EC2_CREDENTIALS]) {
-                    sh '''
-                        set -eu
+                script {
+                    if (!params.EC2_HOST?.trim()) {
+                        error('Set EC2_HOST when DEPLOY_TO_EC2 is enabled.')
+                    }
+                    sshagent(credentials: [params.EC2_CREDENTIALS_ID]) {
+                        withEnv([
+                            "EC2_HOST=${params.EC2_HOST}",
+                            "EC2_USER=${params.EC2_USER}",
+                            "EC2_PROJECT_DIR=${params.EC2_PROJECT_DIR}"
+                        ]) {
+                            sh '''
+                                set -eu
 
-                        ssh -o StrictHostKeyChecking=yes \
-                            "${EC2_USER}@${EC2_HOST}" \
-                            "set -e
+                                docker save "${DOCKER_IMAGE}" | gzip -1 | ssh -o StrictHostKeyChecking=yes \\
+                                    "${EC2_USER}@${EC2_HOST}" 'gunzip | docker load'
 
-                             cd ${EC2_PROJECT_DIR}
-
-                             git fetch origin
-                             git reset --hard origin/main
-
-                             docker build \
-                                 -t cloudpulse-backend:latest \
-                                 .
-
-                             docker stop cloudpulse-backend 2>/dev/null || true
-                             docker rm cloudpulse-backend 2>/dev/null || true
-
-                             docker run -d \
-                                 --name cloudpulse-backend \
-                                 --restart unless-stopped \
-                                 --env-file .env \
-                                 -e ML_MODEL_BUCKET=cloudpulse-ml-models-306005334008 \
-                                 -p 8000:8000 \
-                                 cloudpulse-backend:latest
-
-                             docker ps --filter name=cloudpulse-backend"
-                    '''
+                                ssh -o StrictHostKeyChecking=yes \\
+                                    "${EC2_USER}@${EC2_HOST}" \\
+                                    "set -e
+                                     docker tag ${DOCKER_IMAGE} cloudpulse-backend:latest
+                                     docker stop cloudpulse-backend 2>/dev/null || true
+                                     docker rm cloudpulse-backend 2>/dev/null || true
+                                     docker run -d \\\\
+                                         --name cloudpulse-backend \\\\
+                                         --restart unless-stopped \\\\
+                                         --env-file ${EC2_PROJECT_DIR}/.env \\\\
+                                         -p 8000:8000 \\\\
+                                         ${DOCKER_IMAGE}
+                                     docker ps --filter name=cloudpulse-backend"
+                            '''
+                        }
+                    }
                 }
             }
         }
+
         stage('Health Check') {
+            when {
+                expression { params.DEPLOY_TO_EC2 }
+            }
             steps {
-                sshagent(credentials: [env.EC2_CREDENTIALS]) {
-                    sh '''
-                        set -eu
+                script {
+                    sshagent(credentials: [params.EC2_CREDENTIALS_ID]) {
+                        withEnv([
+                            "EC2_HOST=${params.EC2_HOST}",
+                            "EC2_USER=${params.EC2_USER}"
+                        ]) {
+                            sh '''
+                                set -eu
 
-                        for attempt in 1 2 3 4 5; do
-                            if ssh -o StrictHostKeyChecking=yes \
-                                "${EC2_USER}@${EC2_HOST}" \
-                                'curl -fsS http://localhost:8000/health'; then
-                                echo "Health check passed."
-                                exit 0
-                            fi
+                                for attempt in 1 2 3 4 5; do
+                                    if ssh -o StrictHostKeyChecking=yes \\
+                                        "${EC2_USER}@${EC2_HOST}" \\
+                                        'curl -fsS http://localhost:8000/health && curl -fsS http://localhost:8000/api/v1/db/health'; then
+                                        echo "Application and database health checks passed."
+                                        exit 0
+                                    fi
 
-                            echo "Health check attempt ${attempt} failed. Retrying..."
-                            sleep 5
-                        done
+                                    echo "Health check attempt ${attempt} failed. Retrying..."
+                                    sleep 5
+                                done
 
-                        ssh -o StrictHostKeyChecking=yes \
-                            "${EC2_USER}@${EC2_HOST}" \
-                            'docker logs --tail 100 cloudpulse-backend' || true
+                                ssh -o StrictHostKeyChecking=yes \\
+                                    "${EC2_USER}@${EC2_HOST}" \\
+                                    'docker logs --tail 100 cloudpulse-backend' || true
 
-                        echo "Health check failed after 5 attempts."
-                        exit 1
-                    '''
+                                echo "Health check failed after 5 attempts."
+                                exit 1
+                            '''
+                        }
+                    }
                 }
             }
         }

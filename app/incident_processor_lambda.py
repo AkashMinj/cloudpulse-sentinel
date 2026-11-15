@@ -2,6 +2,7 @@ import json
 import os
 
 import psycopg2
+from psycopg2.extras import Json
 
 try:
     from incident_engine import detect_incidents
@@ -32,13 +33,14 @@ def process_message(record):
 
     metrics = body["metrics"]
 
-    incidents = detect_incidents(metrics)
+    incidents = detect_incidents(metrics, thresholds=body.get("thresholds"))
+
+    metric_id = metrics.get("metric_id")
+    if metric_id is None:
+        raise ValueError("metric_collected event is missing metrics.metric_id")
 
     if not incidents:
-        print(
-            f"No incidents detected for "
-            f"metric_id={metrics['metric_id']}"
-        )
+        print(f"No incidents detected for metric_id={metric_id}")
         return
 
     connection = None
@@ -66,10 +68,21 @@ def process_message(record):
                 ),
             )
 
-            if cursor.fetchone() is not None:
-                print(
-                    f"Duplicate open incident skipped: "
-                    f"{incident['incident_type']}"
+            existing = cursor.fetchone()
+            if existing is not None:
+                cursor.execute(
+                    """
+                    INSERT INTO incident_events (
+                        incident_id, event_type, event_message, metadata, event_timestamp
+                    )
+                    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP);
+                    """,
+                    (
+                        existing[0],
+                        "async_processor_confirmed",
+                        "SQS/Lambda processor evaluated the metric and confirmed an existing open incident",
+                        Json({"metric_id": metric_id, "incident_type": incident["incident_type"]}),
+                    ),
                 )
                 continue
 
@@ -88,14 +101,15 @@ def process_message(record):
                 VALUES (
                     %s, %s, %s, %s, %s,
                     %s, %s, %s, %s
-                );
+                )
+                RETURNING id;
             """
 
             cursor.execute(
                 incident_query,
                 (
                     incident["instance_id"],
-                    metrics["metric_id"],
+                    metric_id,
                     incident["incident_type"],
                     incident["severity"],
                     incident["title"],
@@ -103,6 +117,21 @@ def process_message(record):
                     incident["metric_value"],
                     incident["threshold_value"],
                     incident["detected_at"],
+                ),
+            )
+            incident_id = cursor.fetchone()[0]
+            cursor.execute(
+                """
+                INSERT INTO incident_events (
+                    incident_id, event_type, event_message, metadata, event_timestamp
+                )
+                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP);
+                """,
+                (
+                    incident_id,
+                    "async_incident_created",
+                    "Incident created by the asynchronous SQS/Lambda processor",
+                    Json({"metric_id": metric_id, "incident_type": incident["incident_type"]}),
                 ),
             )
 

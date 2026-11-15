@@ -1,0 +1,96 @@
+name: cloudpulse-sentinel
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:?Set DB_NAME in .env}
+      POSTGRES_USER: ${DB_USER:?Set DB_USER in .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_database.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:?Set DB_NAME in .env}
+      DB_USER: ${DB_USER:?Set DB_USER in .env}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      ML_LOCAL_MODEL_PATH: /app/models/isolation-forest.pkl
+      METRICS_INGEST_TOKEN: ${METRICS_INGEST_TOKEN:-}
+      CLOUDPULSE_SNS_TOPIC_ARN: ${CLOUDPULSE_SNS_TOPIC_ARN:-}
+      METRICS_ARCHIVE_BUCKET: ${METRICS_ARCHIVE_BUCKET:-}
+      ML_MODEL_BUCKET: ${ML_MODEL_BUCKET:-}
+      CLOUDPULSE_SQS_QUEUE_URL: ${CLOUDPULSE_SQS_QUEUE_URL:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_TO: ${SMTP_TO:-}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-true}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ml_models:/app/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  metrics-collector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "/app/scripts/local_collector.py"]
+    environment:
+      BACKEND_URL: http://backend:8000
+      COLLECTION_INTERVAL_SECONDS: ${COLLECTION_INTERVAL_SECONDS:-30}
+    depends_on:
+      backend:
+        condition: service_healthy
+    # The shared Dockerfile healthcheck targets the API port; this worker
+    # has no HTTP listener and should not inherit that check.
+    healthcheck:
+      disable: true
+
+  dashboard:
+    build:
+      context: ./cloudpulse-dashboard
+      dockerfile: Dockerfile
+      args:
+        BACKEND_URL: http://backend:8000
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  ml_models:

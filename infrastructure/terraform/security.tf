@@ -1,7 +1,12 @@
 variable "admin_cidr" {
-  description = "Public IP address allowed to access EC2 through SSH"
+  description = "Administrator public IPv4 CIDR allowed to SSH (for example, 203.0.113.10/32)"
   type        = string
-  default     = "0.0.0.0/0"
+  nullable    = false
+
+  validation {
+    condition     = can(cidrhost(var.admin_cidr, 0)) && var.admin_cidr != "0.0.0.0/0"
+    error_message = "admin_cidr must be a valid restricted CIDR and must not be 0.0.0.0/0."
+  }
 }
 
 resource "aws_security_group" "cloudpulse_ec2_sg" {
@@ -10,7 +15,7 @@ resource "aws_security_group" "cloudpulse_ec2_sg" {
   vpc_id      = aws_vpc.cloudpulse_vpc.id
 
   ingress {
-    description = "SSH from administrator IP"
+    description = "SSH from administrator IP only"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"

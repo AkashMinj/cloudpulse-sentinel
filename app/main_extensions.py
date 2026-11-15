@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from app.auth import (
     authenticate_user,
     create_access_token,
+    get_current_user,
     require_auth,
     require_role,
 )
@@ -91,7 +92,7 @@ def register_incident_replay_routes(app):
     @app.get("/api/v1/incidents/{incident_id}/replay")
     def get_incident_replay(
         incident_id: int,
-        current_user: Optional[dict] = Depends(require_auth)
+        current_user: Optional[dict] = Depends(get_current_user)
     ):
         """Get complete incident timeline for replay."""
         connection = None
@@ -119,7 +120,7 @@ def register_incident_replay_routes(app):
     @app.get("/api/v1/incidents/{incident_id}/events")
     def get_incident_events(
         incident_id: int,
-        current_user: Optional[dict] = Depends(require_auth)
+        current_user: Optional[dict] = Depends(get_current_user)
     ):
         """Get all events for an incident."""
         connection = None
@@ -163,39 +164,84 @@ def register_ml_routes(app, ml_service):
     def train_ml_model(current_user: dict = Depends(require_role("analyst"))):
         """Train the ML anomaly detection model on historical data."""
         connection = None
-
         try:
             connection = get_db_connection()
             result = ml_service.train_model(connection)
+            if result.get("status") == "insufficient_data":
+                raise HTTPException(status_code=400, detail=result)
             return result
-
+        except HTTPException:
+            raise
         except Exception:
+            import logging
+            logging.getLogger("cloudpulse").exception("ML model training failed")
             raise HTTPException(
                 status_code=503,
-                detail="Unable to train ML model",
+                detail="Unable to train ML model. Check backend logs.",
             )
         finally:
             if connection:
                 connection.close()
 
     @app.get("/api/v1/ml/status")
-    def get_ml_status(current_user: Optional[dict] = Depends(require_auth)):
-        """Get ML model status and training information."""
-        return {
+    def get_ml_status():
+        """Get model state, persisted training metadata and detection counts."""
+        connection = None
+        cursor = None
+        result = {
             "is_trained": ml_service.is_trained,
             "model_version": ml_service.model_version,
             "model_type": "IsolationForest",
+            "training_samples": ml_service.training_samples,
+            "trained_at": ml_service.trained_at,
             "features": [
                 "cpu_usage_percent",
                 "memory_usage_percent",
                 "disk_usage_percent",
             ],
+            "detection_count": 0,
+            "anomaly_count": 0,
+            "latest": None,
         }
+        try:
+            connection = get_db_connection()
+            cursor = connection.cursor()
+            cursor.execute("SELECT COUNT(*), COUNT(*) FILTER (WHERE is_anomaly) FROM anomaly_detections;")
+            counts = cursor.fetchone()
+            result["detection_count"] = int(counts[0] or 0)
+            result["anomaly_count"] = int(counts[1] or 0)
+            cursor.execute(
+                """
+                SELECT instance_id, metric_id, is_anomaly, anomaly_score, model_version, detected_at
+                FROM anomaly_detections ORDER BY detected_at DESC LIMIT 1;
+                """
+            )
+            latest = cursor.fetchone()
+            if latest:
+                result["latest"] = {
+                    "instance_id": latest[0],
+                    "metric_id": latest[1],
+                    "is_anomaly": latest[2],
+                    "anomaly_score": float(latest[3]),
+                    "model_version": latest[4],
+                    "detected_at": latest[5].isoformat(),
+                }
+        except Exception:
+            import logging
+            logging.getLogger("cloudpulse").exception("ML status query failed")
+            # Status remains useful even when the detection table is unavailable.
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+        return result
 
     @app.get("/api/v1/anomalies")
     def get_anomalies(
         limit: int = Query(default=20, ge=1, le=100),
-        current_user: Optional[dict] = Depends(require_auth)
+        instance_id: Optional[str] = Query(default=None, min_length=1, max_length=255),
+        is_anomaly: Optional[bool] = None,
     ):
         """Get recent anomaly detections."""
         connection = None
@@ -210,11 +256,20 @@ def register_ml_routes(app, ml_service):
                     id, instance_id, metric_id, is_anomaly,
                     anomaly_score, model_version, features, detected_at
                 FROM anomaly_detections
-                ORDER BY detected_at DESC
-                LIMIT %s;
             """
-
-            cursor.execute(query, (limit,))
+            conditions = []
+            parameters = []
+            if instance_id:
+                conditions.append("instance_id = %s")
+                parameters.append(instance_id)
+            if is_anomaly is not None:
+                conditions.append("is_anomaly = %s")
+                parameters.append(is_anomaly)
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+            query += " ORDER BY detected_at DESC LIMIT %s;"
+            parameters.append(limit)
+            cursor.execute(query, tuple(parameters))
             rows = cursor.fetchall()
 
             anomalies = []
@@ -240,5 +295,45 @@ def register_ml_routes(app, ml_service):
         finally:
             if cursor:
                 cursor.close()
+            if connection:
+                connection.close()
+
+
+# ============================
+# REMEDIATION ENDPOINTS
+# ============================
+
+from app.remediation_service import RemediationService
+
+remediation_service = RemediationService()
+
+
+def register_remediation_routes(app):
+    """Register remediation routes."""
+
+    @app.post("/api/v1/remediate")
+    def execute_remediation(
+        incident_id: int,
+        action: str,
+        confirm: bool = False,
+        current_user: dict = Depends(require_role("admin")),
+    ):
+        """Execute a confirmed remediation action as the authenticated admin."""
+        if not confirm:
+            raise HTTPException(status_code=400, detail="Explicit confirmation is required (confirm=true).")
+        connection = None
+        try:
+            connection = get_db_connection()
+            result = remediation_service.execute_remediation(
+                connection, incident_id, action, current_user["username"]
+            )
+            return result
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception:
+            raise HTTPException(
+                status_code=503, detail="Unable to execute remediation"
+            )
+        finally:
             if connection:
                 connection.close()

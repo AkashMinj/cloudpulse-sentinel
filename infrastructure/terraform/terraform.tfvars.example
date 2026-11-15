@@ -1,0 +1,4 @@
+aws_region      = "us-east-1"
+db_username     = "cloudpulse_admin"
+db_password     = "REPLACE_WITH_A_NEW_STRONG_DATABASE_PASSWORD"
+admin_cidr      = "203.0.113.10/32"

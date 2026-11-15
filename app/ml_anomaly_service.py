@@ -12,6 +12,7 @@ import pickle
 
 import boto3
 from botocore.exceptions import ClientError
+from pathlib import Path
 
 ML_INCIDENT_CONFIRMATIONS = 3
 
@@ -22,59 +23,81 @@ class MLAnomalyService:
         self.detector = ResourceAnomalyDetector(contamination=0.05, random_state=42)
         self.is_trained = False
         self.model_version = "1.0.0"
+        self.training_samples = None
+        self.trained_at = None
         self.model_bucket = os.getenv("ML_MODEL_BUCKET")
         self.model_key = "models/isolation-forest.pkl"
-        self.s3_client = boto3.client("s3", region_name="us-east-1")
+        self.s3_client = boto3.client("s3", region_name=os.getenv("AWS_REGION", "us-east-1"))
+        self.local_model_path = Path(
+            os.getenv("ML_LOCAL_MODEL_PATH", "/app/models/isolation-forest.pkl")
+        )
 
     def load_model(self) -> bool:
-        """Load the trained detector from S3 if an artifact exists."""
-        if not self.model_bucket:
+        """Load a trained detector from S3 or local storage."""
+        artifact = None
+        if self.model_bucket:
+            try:
+                response = self.s3_client.get_object(
+                    Bucket=self.model_bucket,
+                    Key=self.model_key,
+                )
+                artifact = pickle.loads(response["Body"].read())
+            except ClientError as exc:
+                error_code = exc.response.get("Error", {}).get("Code")
+                if error_code not in ("NoSuchKey", "404", "NotFound"):
+                    raise
+        if artifact is None and self.local_model_path.exists():
+            with self.local_model_path.open("rb") as model_file:
+                artifact = pickle.load(model_file)
+
+        if artifact is None:
             return False
+        if artifact.get("model_version") != self.model_version:
+            raise ValueError("Saved model version is incompatible.")
 
-        try:
-            response = self.s3_client.get_object(
-                Bucket=self.model_bucket,
-                Key=self.model_key,
-            )
-            artifact = pickle.loads(response["Body"].read())
-
-            if artifact.get("model_version") != self.model_version:
-                raise ValueError("Saved model version is incompatible.")
-
-            detector = artifact.get("detector")
-            if not isinstance(detector, ResourceAnomalyDetector):
-                raise ValueError("Saved model has an invalid detector.")
-
-            if not detector._trained:
-                raise ValueError("Saved detector is not trained.")
-
-            self.detector = detector
-            self.is_trained = True
-            return True
-
-        except ClientError as exc:
-            error_code = exc.response.get("Error", {}).get("Code")
-            if error_code in ("NoSuchKey", "404", "NotFound"):
-                return False
-            raise
+        detector = artifact.get("detector")
+        if not isinstance(detector, ResourceAnomalyDetector):
+            raise ValueError("Saved model has an invalid detector.")
+        if not detector._trained:
+            raise ValueError("Saved detector is not trained.")
+        self.detector = detector
+        self.training_samples = artifact.get("training_samples")
+        self.trained_at = artifact.get("trained_at")
+        self.is_trained = True
+        return True
 
     def _save_model(self, detector) -> None:
-        """Save a trained detector to S3."""
-        if not self.model_bucket:
-            raise RuntimeError("ML_MODEL_BUCKET is not configured.")
+        """Save the trained detector to S3 or local storage."""
 
         artifact = {
             "model_version": self.model_version,
             "detector": detector,
+            "training_samples": self.training_samples,
+            "trained_at": self.trained_at,
         }
 
-        self.s3_client.put_object(
-            Bucket=self.model_bucket,
-            Key=self.model_key,
-            Body=pickle.dumps(artifact, protocol=pickle.HIGHEST_PROTOCOL),
-            ContentType="application/octet-stream",
-        )
+        if self.model_bucket:
+            self.s3_client.put_object(
+                Bucket=self.model_bucket,
+                Key=self.model_key,
+                Body=pickle.dumps(
+                    artifact,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                ),
+                ContentType="application/octet-stream",
+            )
+        else:
+            self.local_model_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
 
+            with self.local_model_path.open("wb") as model_file:
+                pickle.dump(
+                    artifact,
+                    model_file,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
     def train_model(self, connection) -> Dict:
         """
         Train the anomaly detection model using historical metrics.
@@ -128,7 +151,15 @@ class MLAnomalyService:
             candidate.fit(metrics)
 
             # Persist first; activate only if saving succeeds.
-            self._save_model(candidate)
+            trained_at = datetime.now(timezone.utc).isoformat()
+            previous_samples, previous_trained_at = self.training_samples, self.trained_at
+            self.training_samples = len(metrics)
+            self.trained_at = trained_at
+            try:
+                self._save_model(candidate)
+            except Exception:
+                self.training_samples, self.trained_at = previous_samples, previous_trained_at
+                raise
 
             self.detector = candidate
             self.is_trained = True
@@ -137,6 +168,7 @@ class MLAnomalyService:
                 "message": "Model trained successfully",
                 "samples": len(metrics),
                 "model_version": self.model_version,
+                "trained_at": self.trained_at,
             }
 
         finally:
@@ -285,7 +317,7 @@ class MLAnomalyService:
                 SELECT metric_id, is_anomaly
                 FROM anomaly_detections
                 WHERE instance_id = %s
-                ORDER BY id DESC
+                ORDER BY detected_at DESC, id DESC
                 LIMIT %s;
             """
 

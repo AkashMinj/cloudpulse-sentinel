@@ -1,6 +1,8 @@
 
 import os
+from contextlib import asynccontextmanager
 import time
+import logging
 from collections import deque
 from threading import Lock
 import urllib.request
@@ -10,6 +12,9 @@ import psycopg2
 import psutil
 from app.incident_engine import detect_incidents
 from app.sqs_publisher import publish_metric_event
+from app.notification_service import NotificationService
+from app.cost_analyzer import build_utilization_recommendations
+from app.metrics_archive_service import MetricsArchiveService
 from app.incident_replay import IncidentReplay
 from app.ml_anomaly_service import MLAnomalyService
 from app.auth import (
@@ -20,26 +25,49 @@ from app.auth import (
     require_role,
     get_password_hash,
 )
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from pydantic import BaseModel
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from pydantic import BaseModel, Field
+from psycopg2.extras import Json
+from app.migrations import apply_runtime_migrations
 
-app = FastAPI(
-    title="CloudPulse Sentinel",
-    version="0.8.0",
-)
+logger = logging.getLogger("cloudpulse")
 
-# Initialize ML service
+# Initialize services before creating the FastAPI lifespan handler.
 ml_service = MLAnomalyService()
-@app.on_event("startup")
-async def load_ml_model():
+notification_service = NotificationService()
+metrics_archive_service = MetricsArchiveService()
+
+
+@asynccontextmanager
+async def app_lifespan(_app):
+    try:
+        migration_connection = get_db_connection()
+        try:
+            apply_runtime_migrations(migration_connection)
+        finally:
+            migration_connection.close()
+    except Exception:
+        # Keep the API process observable if the database is temporarily unavailable.
+        # Database-backed endpoints will return a clear service error until it recovers.
+        logger.exception("CloudPulse runtime database migrations failed")
+
     try:
         loaded = ml_service.load_model()
         if loaded:
-            print("ML model loaded successfully from S3.")
+            logger.info("ML model loaded successfully from persistent storage.")
         else:
-            print("No saved ML model found; training is required.")
-    except Exception as exc:
-        print(f"Failed to load ML model from S3: {exc}")
+            logger.info("No saved ML model found; training is required.")
+    except Exception:
+        logger.exception("Failed to load ML model")
+    yield
+
+
+app = FastAPI(
+    title="CloudPulse Sentinel",
+    version="0.9.0",
+    lifespan=app_lifespan,
+)
+
 # Request telemetry
 REQUEST_WINDOW_SECONDS = 300
 _request_lock = Lock()
@@ -156,16 +184,102 @@ def get_db_connection():
     )
 
 
+DEFAULT_THRESHOLDS = {
+    "cpu": {"warning": 80.0, "critical": 95.0},
+    "memory": {"warning": 80.0, "critical": 95.0},
+    "disk": {"warning": 80.0, "critical": 95.0},
+}
+
+
+class ThresholdRequest(BaseModel):
+    cpu_warning: float = Field(default=80, ge=1, le=99)
+    cpu_critical: float = Field(default=95, ge=2, le=100)
+    memory_warning: float = Field(default=80, ge=1, le=99)
+    memory_critical: float = Field(default=95, ge=2, le=100)
+    disk_warning: float = Field(default=80, ge=1, le=99)
+    disk_critical: float = Field(default=95, ge=2, le=100)
+
+
+class MetricsIngestRequest(BaseModel):
+    instance_id: str = Field(min_length=1, max_length=255)
+    cpu_usage_percent: float = Field(ge=0, le=100)
+    memory_usage_percent: float = Field(ge=0, le=100)
+    disk_usage_percent: float = Field(ge=0, le=100)
+    cpu_count: int = Field(default=1, ge=1)
+    memory_total_gb: float = Field(default=0, ge=0)
+    memory_available_gb: float = Field(default=0, ge=0)
+    disk_total_gb: float = Field(default=0, ge=0)
+    disk_free_gb: float = Field(default=0, ge=0)
+    latency_ms: float | None = Field(default=None, ge=0)
+    error_rate_percent: float | None = Field(default=None, ge=0, le=100)
+    request_rate: float | None = Field(default=None, ge=0)
+    timestamp: datetime | None = None
+
+
+def load_thresholds(cursor):
+    """Read configured warning/critical resource thresholds."""
+    result = {
+        name: values.copy() for name, values in DEFAULT_THRESHOLDS.items()
+    }
+    cursor.execute(
+        "SELECT metric_name, warning_threshold, critical_threshold FROM monitoring_thresholds;"
+    )
+    for metric_name, warning_threshold, critical_threshold in cursor.fetchall():
+        if metric_name in result:
+            result[metric_name] = {
+                "warning": float(warning_threshold),
+                "critical": float(critical_threshold),
+            }
+    return result
+
+
+def store_notification_result(connection, incident: dict, channel: str, result: dict) -> None:
+    """Persist channel outcome without recording credentials or webhook URLs."""
+    details = {
+        key: result[key]
+        for key in ("reason", "error_type", "recipient_count")
+        if key in result
+    }
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO notification_history
+                (incident_id, instance_id, channel, status, provider_reference, details)
+            VALUES (%s, %s, %s, %s, %s, %s);
+            """,
+            (
+                incident.get("id"),
+                incident.get("instance_id"),
+                channel,
+                result.get("status", "unknown"),
+                result.get("message_id"),
+                Json(details),
+            ),
+        )
+        connection.commit()
+    finally:
+        cursor.close()
+
+
 # -------------------------
 # SYSTEM METRICS COLLECTION
 # -------------------------
 
-def collect_system_metrics():
-    token = get_metadata_token()
 
-    instance_id = get_instance_metadata(
-        "instance-id", token
-    )
+def collect_system_metrics():
+    # Use a configured instance ID when running locally or in a
+    # non-EC2 environment. Otherwise, discover the EC2 instance ID.
+    instance_id = os.getenv("INSTANCE_ID")
+
+    if not instance_id:
+        try:
+            token = get_metadata_token()
+            instance_id = get_instance_metadata("instance-id", token)
+        except Exception:
+            if os.getenv("ENVIRONMENT", "local").lower() == "aws":
+                raise
+            instance_id = "local-docker"
 
     disk_usage = psutil.disk_usage("/")
     memory_usage = psutil.virtual_memory()
@@ -204,7 +318,7 @@ def root():
     return {
         "service": "CloudPulse Sentinel",
         "status": "running",
-        "version": "0.8.0",
+        "version": "0.9.0",
     }
 
 
@@ -359,22 +473,25 @@ def collect_and_store_metrics():
         )
 
         metric_id = cursor.fetchone()[0]
-                # Automatically resolve incidents when metrics return to normal
+        created_incidents = []
+        configured_thresholds = load_thresholds(cursor)
+
+        # Automatically resolve incidents when metrics return below the warning threshold.
         resolution_checks = [
             {
                 "incident_type": "high_cpu",
                 "value": metrics["cpu_usage_percent"],
-                "threshold": 80,
+                "threshold": configured_thresholds["cpu"]["warning"],
             },
             {
                 "incident_type": "high_memory",
                 "value": metrics["memory_usage_percent"],
-                "threshold": 80,
+                "threshold": configured_thresholds["memory"]["warning"],
             },
             {
                 "incident_type": "high_disk",
                 "value": metrics["disk_usage_percent"],
-                "threshold": 80,
+                "threshold": configured_thresholds["disk"]["warning"],
             },
         ]
 
@@ -387,7 +504,8 @@ def collect_and_store_metrics():
                         resolved_at = CURRENT_TIMESTAMP
                     WHERE instance_id = %s
                       AND incident_type = %s
-                      AND status = 'open';
+                      AND status = 'open'
+                    RETURNING id;
                 """
 
                 cursor.execute(
@@ -397,9 +515,21 @@ def collect_and_store_metrics():
                         check["incident_type"],
                     ),
                 )
+                for (resolved_incident_id,) in cursor.fetchall():
+                    IncidentReplay.record_event(
+                        connection,
+                        resolved_incident_id,
+                        "incident_resolved",
+                        "Metrics returned below the configured threshold",
+                        {
+                            "metric_id": metric_id,
+                            "metric_value": float(check["value"]),
+                            "threshold": check["threshold"],
+                        },
+                    )
 
         # Detect incidents from collected metrics
-        incidents = detect_incidents(metrics)
+        incidents = detect_incidents(metrics, configured_thresholds)
 
         for incident in incidents:
             duplicate_check_query = """
@@ -538,6 +668,10 @@ def collect_and_store_metrics():
                     "severity": incident["severity"],
                 },
             )
+            created_incidents.append({
+                **incident,
+                "id": incident_id,
+            })
 
         # ML anomaly detection
         try:
@@ -593,6 +727,15 @@ def collect_and_store_metrics():
                                     ),
                                 },
                             )
+                            created_incidents.append({
+                                "id": anomaly_incident_id,
+                                "instance_id": metrics["instance_id"],
+                                "incident_type": "ml_anomaly",
+                                "severity": ml_severity,
+                                "title": "ML anomaly detected",
+                                "description": "Isolation Forest detected an unusual resource pattern.",
+                                "detected_at": metrics["timestamp"],
+                            })
 
                     else:
                         cursor.execute(
@@ -625,13 +768,76 @@ def collect_and_store_metrics():
 
             cursor.execute("RELEASE SAVEPOINT ml_anomaly_detection")
 
-        except Exception as ml_error:
+        except Exception:
             cursor.execute("ROLLBACK TO SAVEPOINT ml_anomaly_detection")
             cursor.execute("RELEASE SAVEPOINT ml_anomaly_detection")
-            print(f"ML detection error: {ml_error}", flush=True)
+            logger.exception("ML anomaly detection failed")
 
         connection.commit()
-        publish_metric_event(metrics)
+
+        # Deliver notifications after the incident transaction commits so a provider
+        # outage can never roll back the metric or incident records.
+        for incident_notice in created_incidents:
+            deliveries = (
+                ("sns", notification_service.notify_incident),
+                ("email", notification_service.notify_email),
+                ("slack", notification_service.notify_slack),
+            )
+            for channel, sender in deliveries:
+                try:
+                    if channel == "email" and incident_notice.get("severity") != "critical":
+                        notification_result = {
+                            "status": "skipped",
+                            "reason": "Email alerts are configured for critical incidents only.",
+                        }
+                    else:
+                        notification_result = sender(incident_notice)
+                    store_notification_result(
+                        connection, incident_notice, channel, notification_result
+                    )
+                    if channel == "sns" and notification_result.get("status") == "sent":
+                        IncidentReplay.record_event(
+                            connection,
+                            incident_notice["id"],
+                            "notification_sent",
+                            "Incident notification published to the configured SNS topic",
+                            {"message_id": notification_result.get("message_id")},
+                        )
+                        connection.commit()
+                    elif notification_result.get("status") == "failed":
+                        logger.error(
+                            "%s notification failed for incident %s (%s)",
+                            channel,
+                            incident_notice["id"],
+                            notification_result.get("error_type"),
+                        )
+                except Exception:
+                    connection.rollback()
+                    logger.exception(
+                        "Could not process %s notification for incident %s",
+                        channel,
+                        incident_notice["id"],
+                    )
+
+        # The Lambda processor requires the persisted metric ID for traceability.
+        event_metrics = {**metrics, "metric_id": metric_id}
+        try:
+            archive_result = metrics_archive_service.archive_metric(event_metrics)
+            if archive_result.get("status") == "archived":
+                logger.info(
+                    "Archived metric %s to s3://%s/%s",
+                    metric_id,
+                    archive_result["bucket"],
+                    archive_result["key"],
+                )
+        except Exception:
+            logger.exception("Metric %s could not be archived to S3", metric_id)
+
+        try:
+            publish_metric_event(event_metrics, thresholds=configured_thresholds)
+        except Exception:
+            logger.exception("Metric event could not be published to SQS")
+
         return {
             "status": "success",
             "message": "Metrics collected and stored",
@@ -660,12 +866,268 @@ def collect_and_store_metrics():
 
 
 # -------------------------
+# MULTI-INSTANCE METRIC INGESTION
+# -------------------------
+
+@app.post("/api/v1/metrics/ingest")
+def ingest_instance_metrics(
+    request: MetricsIngestRequest,
+    x_metrics_token: str | None = Header(default=None, alias="X-Metrics-Token"),
+):
+    """Accept telemetry from remote per-instance agents using a shared ingest token."""
+    import hmac
+
+    configured_token = os.getenv("METRICS_INGEST_TOKEN", "")
+    if len(configured_token) < 32:
+        raise HTTPException(
+            status_code=503,
+            detail="Remote metric ingestion is disabled until METRICS_INGEST_TOKEN is configured.",
+        )
+    if not x_metrics_token or not hmac.compare_digest(x_metrics_token, configured_token):
+        raise HTTPException(status_code=401, detail="Invalid metrics ingestion token")
+
+    metrics = request.model_dump()
+    timestamp = metrics.get("timestamp") or datetime.now(timezone.utc)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    metrics["timestamp"] = timestamp
+
+    connection = None
+    cursor = None
+    created_incidents = []
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        thresholds = load_thresholds(cursor)
+        cursor.execute(
+            """
+            INSERT INTO system_metrics (
+                instance_id, timestamp, cpu_usage_percent, cpu_count,
+                memory_usage_percent, memory_total_gb, memory_available_gb,
+                disk_usage_percent, disk_total_gb, disk_free_gb,
+                latency_ms, error_rate_percent, request_rate
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id;
+            """,
+            (
+                metrics["instance_id"], timestamp,
+                metrics["cpu_usage_percent"], metrics["cpu_count"],
+                metrics["memory_usage_percent"], metrics["memory_total_gb"],
+                metrics["memory_available_gb"], metrics["disk_usage_percent"],
+                metrics["disk_total_gb"], metrics["disk_free_gb"],
+                metrics["latency_ms"], metrics["error_rate_percent"], metrics["request_rate"],
+            ),
+        )
+        metric_id = cursor.fetchone()[0]
+        metrics["metric_id"] = metric_id
+
+        # Resolve threshold incidents when this instance returns below its warning level.
+        resolution_checks = (
+            ("high_cpu", metrics["cpu_usage_percent"], thresholds["cpu"]["warning"]),
+            ("high_memory", metrics["memory_usage_percent"], thresholds["memory"]["warning"]),
+            ("high_disk", metrics["disk_usage_percent"], thresholds["disk"]["warning"]),
+        )
+        for incident_type, value, warning_threshold in resolution_checks:
+            if float(value) < warning_threshold:
+                cursor.execute(
+                    """
+                    UPDATE incidents
+                    SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP
+                    WHERE instance_id = %s AND incident_type = %s AND status = 'open'
+                    RETURNING id;
+                    """,
+                    (metrics["instance_id"], incident_type),
+                )
+                for (resolved_id,) in cursor.fetchall():
+                    IncidentReplay.record_event(
+                        connection,
+                        resolved_id,
+                        "incident_resolved",
+                        "Remote instance metrics returned below the configured threshold",
+                        {
+                            "metric_id": metric_id,
+                            "metric_value": float(value),
+                            "threshold": warning_threshold,
+                        },
+                    )
+
+        for incident in detect_incidents(metrics, thresholds):
+            cursor.execute(
+                """
+                SELECT id FROM incidents
+                WHERE instance_id = %s AND incident_type = %s AND status = 'open'
+                LIMIT 1;
+                """,
+                (incident["instance_id"], incident["incident_type"]),
+            )
+            existing = cursor.fetchone()
+            if existing:
+                cursor.execute(
+                    """
+                    UPDATE incidents
+                    SET metric_id = %s, severity = %s, metric_value = %s,
+                        threshold_value = %s, title = %s, description = %s
+                    WHERE id = %s;
+                    """,
+                    (
+                        metric_id, incident["severity"], incident["metric_value"],
+                        incident["threshold_value"], incident["title"],
+                        incident["description"], existing[0],
+                    ),
+                )
+                continue
+
+            cursor.execute(
+                """
+                INSERT INTO incidents (
+                    instance_id, metric_id, incident_type, severity, title,
+                    description, metric_value, threshold_value, detected_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id;
+                """,
+                (
+                    incident["instance_id"], metric_id, incident["incident_type"],
+                    incident["severity"], incident["title"], incident["description"],
+                    incident["metric_value"], incident["threshold_value"], incident["detected_at"],
+                ),
+            )
+            incident_id = cursor.fetchone()[0]
+            incident_notice = {**incident, "id": incident_id}
+            IncidentReplay.record_event(
+                connection, incident_id, "incident_created",
+                "Incident created from remote instance telemetry",
+                {"metric_id": metric_id, "source": "remote_agent"},
+            )
+            created_incidents.append(incident_notice)
+
+        # Run the same ML anomaly workflow for remote instances as for the local collector.
+        try:
+            cursor.execute("SAVEPOINT remote_ml_detection")
+            if ml_service.is_trained:
+                anomaly_result = ml_service.detect_anomaly(connection, metrics, metric_id)
+                if anomaly_result and anomaly_result.is_anomaly:
+                    anomaly_incident_id = ml_service.create_anomaly_incident(
+                        connection, metrics, anomaly_result, metric_id
+                    )
+                    if anomaly_incident_id:
+                        ml_severity = (
+                            "critical" if anomaly_result.anomaly_score < -0.5
+                            else "warning" if anomaly_result.anomaly_score < -0.3
+                            else "info"
+                        )
+                        IncidentReplay.record_event(
+                            connection,
+                            anomaly_incident_id,
+                            "incident_created",
+                            "ML anomaly incident created from remote instance telemetry",
+                            {"severity": ml_severity, "metric_id": metric_id},
+                        )
+                        IncidentReplay.record_event(
+                            connection,
+                            anomaly_incident_id,
+                            "ml_anomaly_detected",
+                            f"ML model detected anomaly with score {anomaly_result.anomaly_score:.4f}",
+                            {
+                                "anomaly_score": anomaly_result.anomaly_score,
+                                "signals": ml_service.get_anomaly_signals(metrics),
+                            },
+                        )
+                        created_incidents.append({
+                            "id": anomaly_incident_id,
+                            "instance_id": metrics["instance_id"],
+                            "incident_type": "ml_anomaly",
+                            "severity": ml_severity,
+                            "title": "ML anomaly detected",
+                            "description": "Isolation Forest detected an unusual resource pattern.",
+                            "detected_at": timestamp,
+                        })
+                elif anomaly_result:
+                    cursor.execute(
+                        """
+                        UPDATE incidents
+                        SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP
+                        WHERE instance_id = %s AND incident_type = 'ml_anomaly' AND status = 'open'
+                        RETURNING id;
+                        """,
+                        (metrics["instance_id"],),
+                    )
+                    for (resolved_id,) in cursor.fetchall():
+                        IncidentReplay.record_event(
+                            connection,
+                            resolved_id,
+                            "incident_resolved",
+                            "Remote instance ML prediction returned to normal",
+                            {"metric_id": metric_id, "anomaly_score": anomaly_result.anomaly_score},
+                        )
+            cursor.execute("RELEASE SAVEPOINT remote_ml_detection")
+        except Exception:
+            cursor.execute("ROLLBACK TO SAVEPOINT remote_ml_detection")
+            cursor.execute("RELEASE SAVEPOINT remote_ml_detection")
+            logger.exception("Remote instance ML anomaly detection failed")
+
+        connection.commit()
+
+        for incident_notice in created_incidents:
+            for channel, sender in (
+                ("sns", notification_service.notify_incident),
+                ("email", notification_service.notify_email),
+                ("slack", notification_service.notify_slack),
+            ):
+                try:
+                    if channel == "email" and incident_notice.get("severity") != "critical":
+                        delivery = {
+                            "status": "skipped",
+                            "reason": "Email alerts are configured for critical incidents only.",
+                        }
+                    else:
+                        delivery = sender(incident_notice)
+                    store_notification_result(
+                        connection, incident_notice, channel, delivery
+                    )
+                except Exception:
+                    connection.rollback()
+                    logger.exception("Remote-agent %s notification failed", channel)
+
+        try:
+            metrics_archive_service.archive_metric(metrics)
+        except Exception:
+            logger.exception("Remote metric %s could not be archived", metric_id)
+        try:
+            publish_metric_event(metrics, thresholds=thresholds)
+        except Exception:
+            logger.exception("Remote metric %s could not be published to SQS", metric_id)
+
+        return {
+            "status": "success",
+            "metric_id": metric_id,
+            "instance_id": metrics["instance_id"],
+            "incidents_created": len(created_incidents),
+            "timestamp": timestamp.isoformat(),
+        }
+    except HTTPException:
+        if connection is not None:
+            connection.rollback()
+        raise
+    except Exception:
+        if connection is not None:
+            connection.rollback()
+        logger.exception("Remote metric ingestion failed")
+        raise HTTPException(status_code=503, detail="Unable to ingest remote instance metrics")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection is not None:
+            connection.close()
+
+
+# -------------------------
 # METRICS HISTORY
 # -------------------------
 
 @app.get("/api/v1/metrics/history")
 def metrics_history(
-    limit: int = Query(default=20, ge=1, le=100)
+    limit: int = Query(default=20, ge=1, le=500),
+    instance_id: str | None = Query(default=None, min_length=1, max_length=255),
 ):
     connection = None
     cursor = None
@@ -692,11 +1154,15 @@ def metrics_history(
                 request_rate,
                 created_at
             FROM system_metrics
-            ORDER BY timestamp DESC
-            LIMIT %s;
         """
+        parameters = []
+        if instance_id:
+            query += " WHERE instance_id = %s"
+            parameters.append(instance_id)
+        query += " ORDER BY timestamp DESC LIMIT %s;"
+        parameters.append(limit)
 
-        cursor.execute(query, (limit,))
+        cursor.execute(query, tuple(parameters))
         rows = cursor.fetchall()
 
         metrics = []
@@ -746,7 +1212,8 @@ def metrics_history(
 def get_incidents(
     limit: int = Query(default=20, ge=1, le=100),
     severity: str | None = Query(default=None),
-    status: str | None = Query(default=None)
+    status: str | None = Query(default=None),
+    instance_id: str | None = Query(default=None, min_length=1, max_length=255),
 ):
     connection = None
     cursor = None
@@ -769,7 +1236,9 @@ def get_incidents(
                 status,
                 detected_at,
                 resolved_at,
-                created_at
+                created_at,
+                acknowledged_at,
+                acknowledged_by
             FROM incidents
         """
 
@@ -783,6 +1252,9 @@ def get_incidents(
         if status is not None:
             conditions.append("status = %s")
             parameters.append(status)
+        if instance_id is not None:
+            conditions.append("instance_id = %s")
+            parameters.append(instance_id)
 
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
@@ -810,6 +1282,8 @@ def get_incidents(
                 "detected_at": row[10].isoformat(),
                 "resolved_at": row[11].isoformat() if row[11] else None,
                 "created_at": row[12].isoformat(),
+                "acknowledged_at": row[13].isoformat() if row[13] else None,
+                "acknowledged_by": row[14],
             })
 
         return {
@@ -836,7 +1310,10 @@ def get_incidents(
 # -------------------------
 
 @app.patch("/api/v1/incidents/{incident_id}/resolve")
-def resolve_incident(incident_id: int):
+def resolve_incident(
+    incident_id: int,
+    current_user: dict = Depends(require_role("analyst")),
+):
     connection = None
     cursor = None
 
@@ -872,6 +1349,13 @@ def resolve_incident(incident_id: int):
                 detail="Open incident not found",
             )
 
+        IncidentReplay.record_event(
+            connection,
+            incident_id,
+            "incident_resolved",
+            "Incident manually resolved by an authorized user",
+            {"resolved_by": current_user["username"]},
+        )
         connection.commit()
 
         return {
@@ -910,11 +1394,268 @@ def resolve_incident(incident_id: int):
 
 
 # -------------------------
+# INCIDENT ACKNOWLEDGEMENT
+# -------------------------
+
+@app.patch("/api/v1/incidents/{incident_id}/acknowledge")
+def acknowledge_incident(
+    incident_id: int,
+    current_user: dict = Depends(require_role("analyst")),
+):
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE incidents
+            SET acknowledged_at = CURRENT_TIMESTAMP, acknowledged_by = %s
+            WHERE id = %s AND status = 'open' AND acknowledged_at IS NULL
+            RETURNING id, instance_id, severity, title, acknowledged_at, acknowledged_by;
+            """,
+            (current_user["username"], incident_id),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            cursor.execute(
+                "SELECT id, status, acknowledged_at, acknowledged_by FROM incidents WHERE id = %s;",
+                (incident_id,),
+            )
+            existing = cursor.fetchone()
+            if existing is None:
+                raise HTTPException(status_code=404, detail="Incident not found")
+            if existing[1] != "open":
+                raise HTTPException(status_code=409, detail="Resolved incidents cannot be acknowledged")
+            return {
+                "status": "already_acknowledged",
+                "incident_id": incident_id,
+                "acknowledged_at": existing[2].isoformat() if existing[2] else None,
+                "acknowledged_by": existing[3],
+            }
+
+        IncidentReplay.record_event(
+            connection,
+            incident_id,
+            "incident_acknowledged",
+            "Incident acknowledged by an authorized user",
+            {"acknowledged_by": current_user["username"]},
+        )
+        connection.commit()
+        return {
+            "status": "success",
+            "incident": {
+                "id": row[0],
+                "instance_id": row[1],
+                "severity": row[2],
+                "title": row[3],
+                "acknowledged_at": row[4].isoformat(),
+                "acknowledged_by": row[5],
+            },
+        }
+    except HTTPException:
+        if connection is not None:
+            connection.rollback()
+        raise
+    except Exception:
+        if connection is not None:
+            connection.rollback()
+        logger.exception("Incident acknowledgement failed")
+        raise HTTPException(status_code=503, detail="Unable to acknowledge incident")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection is not None:
+            connection.close()
+
+
+# -------------------------
+# CONFIGURABLE THRESHOLDS
+# -------------------------
+
+@app.get("/api/v1/settings/thresholds")
+def get_threshold_settings():
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        thresholds = load_thresholds(cursor)
+        return {"thresholds": thresholds}
+    except Exception:
+        logger.exception("Threshold settings could not be loaded")
+        raise HTTPException(status_code=503, detail="Unable to retrieve threshold settings")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection is not None:
+            connection.close()
+
+
+@app.put("/api/v1/settings/thresholds")
+def update_threshold_settings(
+    request: ThresholdRequest,
+    current_user: dict = Depends(require_role("admin")),
+):
+    values = request.model_dump()
+    for metric in ("cpu", "memory", "disk"):
+        if values[f"{metric}_warning"] >= values[f"{metric}_critical"]:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{metric.title()} warning threshold must be below its critical threshold.",
+            )
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        for metric in ("cpu", "memory", "disk"):
+            cursor.execute(
+                """
+                INSERT INTO monitoring_thresholds
+                    (metric_name, warning_threshold, critical_threshold, updated_at, updated_by)
+                VALUES (%s, %s, %s, CURRENT_TIMESTAMP, %s)
+                ON CONFLICT (metric_name) DO UPDATE SET
+                    warning_threshold = EXCLUDED.warning_threshold,
+                    critical_threshold = EXCLUDED.critical_threshold,
+                    updated_at = CURRENT_TIMESTAMP,
+                    updated_by = EXCLUDED.updated_by;
+                """,
+                (
+                    metric,
+                    values[f"{metric}_warning"],
+                    values[f"{metric}_critical"],
+                    current_user["username"],
+                ),
+            )
+        connection.commit()
+        return {"status": "success", "thresholds": load_thresholds(cursor)}
+    except HTTPException:
+        if connection is not None:
+            connection.rollback()
+        raise
+    except Exception:
+        if connection is not None:
+            connection.rollback()
+        logger.exception("Threshold settings could not be saved")
+        raise HTTPException(status_code=503, detail="Unable to save threshold settings")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection is not None:
+            connection.close()
+
+
+# -------------------------
+# INSTANCE INVENTORY
+# -------------------------
+
+@app.get("/api/v1/instances")
+def list_instances():
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                latest.instance_id,
+                latest.timestamp,
+                latest.cpu_usage_percent,
+                latest.memory_usage_percent,
+                latest.disk_usage_percent,
+                (SELECT COUNT(*) FROM system_metrics sm WHERE sm.instance_id = latest.instance_id) AS sample_count,
+                (SELECT COUNT(*) FROM incidents i WHERE i.instance_id = latest.instance_id AND i.status = 'open') AS open_incidents
+            FROM (
+                SELECT DISTINCT ON (instance_id)
+                    instance_id, timestamp, cpu_usage_percent,
+                    memory_usage_percent, disk_usage_percent
+                FROM system_metrics
+                ORDER BY instance_id, timestamp DESC
+            ) AS latest
+            ORDER BY latest.instance_id;
+            """
+        )
+        instances = [
+            {
+                "instance_id": row[0],
+                "last_seen": row[1].isoformat(),
+                "cpu_usage_percent": float(row[2]),
+                "memory_usage_percent": float(row[3]),
+                "disk_usage_percent": float(row[4]),
+                "sample_count": int(row[5]),
+                "open_incidents": int(row[6]),
+            }
+            for row in cursor.fetchall()
+        ]
+        return {"count": len(instances), "instances": instances}
+    except Exception:
+        logger.exception("Instance inventory could not be loaded")
+        raise HTTPException(status_code=503, detail="Unable to retrieve instances")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection is not None:
+            connection.close()
+
+
+# -------------------------
+# NOTIFICATION DELIVERY HISTORY
+# -------------------------
+
+@app.get("/api/v1/notifications")
+def get_notification_history(limit: int = Query(default=30, ge=1, le=100)):
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT id, incident_id, instance_id, channel, status,
+                   provider_reference, details, created_at
+            FROM notification_history
+            ORDER BY created_at DESC
+            LIMIT %s;
+            """,
+            (limit,),
+        )
+        rows = cursor.fetchall()
+        return {
+            "count": len(rows),
+            "notifications": [
+                {
+                    "id": row[0],
+                    "incident_id": row[1],
+                    "instance_id": row[2],
+                    "channel": row[3],
+                    "status": row[4],
+                    "provider_reference": row[5],
+                    "details": row[6] or {},
+                    "created_at": row[7].isoformat(),
+                }
+                for row in rows
+            ],
+        }
+    except Exception:
+        logger.exception("Notification history could not be loaded")
+        raise HTTPException(status_code=503, detail="Unable to retrieve notification history")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection is not None:
+            connection.close()
+
+
+# -------------------------
 # DASHBOARD SUMMARY
 # -------------------------
 
 @app.get("/api/v1/dashboard/summary")
-def dashboard_summary():
+def dashboard_summary(
+    instance_id: str | None = Query(default=None, min_length=1, max_length=255),
+):
     connection = None
     cursor = None
 
@@ -922,50 +1663,56 @@ def dashboard_summary():
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        cursor.execute("""
+        metrics_query = """
             SELECT
-                instance_id,
-                cpu_usage_percent,
-                memory_usage_percent,
-                disk_usage_percent,
-                latency_ms,
-                error_rate_percent,
-                request_rate,
-                timestamp
+                instance_id, cpu_usage_percent, memory_usage_percent,
+                disk_usage_percent, latency_ms, error_rate_percent,
+                request_rate, timestamp
             FROM system_metrics
-            ORDER BY timestamp DESC
-            LIMIT 1;
-        """)
-
+        """
+        query_params = ()
+        if instance_id:
+            metrics_query += " WHERE instance_id = %s"
+            query_params = (instance_id,)
+        metrics_query += " ORDER BY timestamp DESC LIMIT 1;"
+        cursor.execute(metrics_query, query_params)
         latest_metrics = cursor.fetchone()
 
-        cursor.execute("""
-            SELECT COUNT(*)
-            FROM incidents
-            WHERE status = 'open';
-        """)
-
+        if instance_id:
+            cursor.execute(
+                "SELECT COUNT(*) FROM incidents WHERE status = 'open' AND instance_id = %s;",
+                (instance_id,),
+            )
+        else:
+            cursor.execute("SELECT COUNT(*) FROM incidents WHERE status = 'open';")
         open_incidents = cursor.fetchone()[0]
 
-        cursor.execute("""
-            SELECT COUNT(*)
-            FROM incidents;
-        """)
-
+        if instance_id:
+            cursor.execute("SELECT COUNT(*) FROM incidents WHERE instance_id = %s;", (instance_id,))
+        else:
+            cursor.execute("SELECT COUNT(*) FROM incidents;")
         total_incidents = cursor.fetchone()[0]
-        cursor.execute("""
-            SELECT
-                metric_id,
-                is_anomaly,
-                anomaly_score,
-                model_version,
-                detected_at
-            FROM anomaly_detections
-            ORDER BY detected_at DESC
-            LIMIT 1;
-        """)
-
-        latest_anomaly = cursor.fetchone()
+        latest_anomaly = None
+        cursor.execute("SAVEPOINT dashboard_anomaly_query")
+        try:
+            anomaly_query = """
+                SELECT metric_id, is_anomaly, anomaly_score, model_version, detected_at
+                FROM anomaly_detections
+            """
+            anomaly_params = ()
+            if instance_id:
+                anomaly_query += " WHERE instance_id = %s"
+                anomaly_params = (instance_id,)
+            anomaly_query += " ORDER BY detected_at DESC LIMIT 1;"
+            cursor.execute(anomaly_query, anomaly_params)
+            latest_anomaly = cursor.fetchone()
+            cursor.execute("RELEASE SAVEPOINT dashboard_anomaly_query")
+        except Exception:
+            cursor.execute("ROLLBACK TO SAVEPOINT dashboard_anomaly_query")
+            cursor.execute("RELEASE SAVEPOINT dashboard_anomaly_query")
+            logger.exception(
+                "Could not read anomaly_detections; returning dashboard summary without latest ML result"
+            )
 
         if latest_metrics is None:
             raise HTTPException(
@@ -1010,6 +1757,7 @@ def dashboard_summary():
         raise
 
     except Exception:
+        logger.exception("Dashboard summary query failed")
         raise HTTPException(
             status_code=503,
             detail="Unable to retrieve dashboard summary",
@@ -1022,6 +1770,67 @@ def dashboard_summary():
         if connection is not None:
             connection.close()
 
+
+# -------------------------
+# COST / RESOURCE UTILIZATION RECOMMENDATIONS
+# -------------------------
+
+@app.get("/api/v1/cost/recommendations")
+def cost_recommendations(
+    days: int = Query(default=7, ge=1, le=30),
+    cpu_threshold: float = Query(default=10.0, ge=0, le=100),
+    memory_threshold: float = Query(default=50.0, ge=0, le=100),
+):
+    """Identify consistently underutilized instances from stored metric history."""
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                instance_id,
+                COUNT(*) AS sample_count,
+                AVG(cpu_usage_percent) AS average_cpu,
+                MAX(cpu_usage_percent) AS peak_cpu,
+                AVG(memory_usage_percent) AS average_memory,
+                MAX(memory_usage_percent) AS peak_memory
+            FROM system_metrics
+            WHERE timestamp >= NOW() - (%s * INTERVAL '1 day')
+            GROUP BY instance_id
+            ORDER BY instance_id;
+            """,
+            (days,),
+        )
+        recommendations = build_utilization_recommendations(
+            cursor.fetchall(),
+            cpu_threshold=cpu_threshold,
+            memory_threshold=memory_threshold,
+        )
+        return {
+            "window_days": days,
+            "cpu_threshold_percent": cpu_threshold,
+            "memory_threshold_percent": memory_threshold,
+            "recommendations": recommendations,
+            "pricing_note": (
+                "Dollar savings are not estimated because live AWS pricing data "
+                "and resource purchase terms are not configured."
+            ),
+        }
+    except Exception:
+        logger.exception("Cost recommendation query failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to calculate resource utilization recommendations",
+        )
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection is not None:
+            connection.close()
+
+
 # ============================
 # PRIORITY 1 FEATURES
 # ============================
@@ -1030,8 +1839,11 @@ from app.main_extensions import (
     register_auth_routes,
     register_incident_replay_routes,
     register_ml_routes,
+    register_remediation_routes,
 )
 
 register_auth_routes(app, ml_service)
 register_incident_replay_routes(app)
 register_ml_routes(app, ml_service)
+
+register_remediation_routes(app)

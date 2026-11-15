@@ -1,48 +1,44 @@
-
 "use client";
 
-import { useEffect, useState } from "react";
-
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type { FormEvent, ReactNode } from "react";
 import {
-  LineChart,
+  CartesianGrid,
+  Legend,
   Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
   XAxis,
   YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-  ResponsiveContainer,
 } from "recharts";
 
-type DashboardData = {
-  instance_id: string;
-  latest_metrics: {
-    cpu_usage_percent: number;
-    memory_usage_percent: number;
-    disk_usage_percent: number;
-    latency_ms: number | null;
-    error_rate_percent: number | null;
-    request_rate: number | null;
-    timestamp: string;
-  };
-  incidents: {
-    open: number;
-    total: number;
-  };
-};
-
-type Metric = {
-  timestamp: string;
+type User = { id: number; username: string; email: string; full_name: string; role: string };
+type Metrics = {
   cpu_usage_percent: number;
   memory_usage_percent: number;
   disk_usage_percent: number;
+  latency_ms: number | null;
+  error_rate_percent: number | null;
+  request_rate: number | null;
+  timestamp: string;
 };
-
-type MetricsResponse = {
-  count: number;
-  metrics: Metric[];
+type Summary = {
+  instance_id: string;
+  latest_metrics: Metrics;
+  incidents: { open: number; total: number };
+  ml_detection?: { is_trained: boolean; model_version: string; latest: { is_anomaly: boolean; anomaly_score: number; detected_at: string } | null };
 };
-
+type Metric = Metrics & { id: number; instance_id: string };
+type Instance = {
+  instance_id: string;
+  last_seen: string;
+  cpu_usage_percent: number;
+  memory_usage_percent: number;
+  disk_usage_percent: number;
+  sample_count: number;
+  open_incidents: number;
+};
 type Incident = {
   id: number;
   instance_id: string;
@@ -56,700 +52,567 @@ type Incident = {
   status: string;
   detected_at: string;
   resolved_at: string | null;
-  created_at: string;
+  acknowledged_at: string | null;
+  acknowledged_by: string | null;
+};
+type Event = { id: number; event_type: string; event_message: string; metadata: Record<string, unknown> | null; event_timestamp: string };
+type Replay = Incident & { timeline: Event[] };
+type MLStatus = {
+  is_trained: boolean;
+  model_version: string;
+  model_type: string;
+  training_samples: number | null;
+  trained_at: string | null;
+  detection_count: number;
+  anomaly_count: number;
+  latest: { instance_id: string; metric_id: number; is_anomaly: boolean; anomaly_score: number; detected_at: string } | null;
+};
+type Anomaly = { id: number; instance_id: string; metric_id: number; is_anomaly: boolean; anomaly_score: number; model_version: string; features: Record<string, number>; detected_at: string };
+type CostRecommendation = { instance_id: string; sample_count: number; average_cpu_percent: number; peak_cpu_percent: number; average_memory_percent: number; peak_memory_percent: number; status: string; recommended_action: string; reason: string };
+type Notification = { id: number; incident_id: number | null; instance_id: string | null; channel: string; status: string; provider_reference: string | null; details: Record<string, unknown>; created_at: string };
+type Thresholds = { cpu: { warning: number; critical: number }; memory: { warning: number; critical: number }; disk: { warning: number; critical: number } };
+type Tab = "overview" | "incidents" | "ml" | "settings";
+
+const API = "/api/backend/v1";
+
+async function api<T>(path: string, token?: string | null, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(init.headers);
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  const response = await fetch(`${API}${path}`, { ...init, headers, cache: "no-store" });
+  if (!response.ok) {
+    let message = `Request failed (${response.status})`;
+    try {
+      const body = await response.json();
+      message = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail ?? body);
+    } catch {
+      // Keep the HTTP fallback when the server did not return JSON.
+    }
+    throw new Error(message);
+  }
+  return response.json() as Promise<T>;
+}
+
+const initialThresholds: Thresholds = {
+  cpu: { warning: 80, critical: 95 },
+  memory: { warning: 80, critical: 95 },
+  disk: { warning: 80, critical: 95 },
 };
 
-type IncidentsResponse = {
-  count: number;
-  incidents: Incident[];
-};
+function Panel({ children, className = "" }: { children: ReactNode; className?: string }) {
+  return <section className={`rounded-2xl border border-slate-800/90 bg-slate-900/75 p-5 shadow-xl shadow-black/10 ${className}`}>{children}</section>;
+}
+
+function SectionTitle({ eyebrow, title, description, action }: { eyebrow?: string; title: string; description?: string; action?: ReactNode }) {
+  return (
+    <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
+      <div>
+        {eyebrow && <p className="mb-1 text-[10px] font-bold uppercase tracking-[0.22em] text-cyan-400">{eyebrow}</p>}
+        <h2 className="text-lg font-semibold tracking-tight text-white">{title}</h2>
+        {description && <p className="mt-1 text-sm text-slate-400">{description}</p>}
+      </div>
+      {action}
+    </div>
+  );
+}
+
+function MetricCard({ label, value, unit, note, accent, icon }: { label: string; value: string; unit?: string; note: string; accent: string; icon: string }) {
+  return (
+    <Panel className="relative overflow-hidden">
+      <div className={`absolute right-0 top-0 h-24 w-24 rounded-full ${accent} opacity-[0.08] blur-2xl`} />
+      <div className="relative flex items-start justify-between">
+        <div>
+          <p className="text-xs font-medium text-slate-400">{label}</p>
+          <p className="mt-3 text-3xl font-semibold tracking-tight text-white">{value}<span className="ml-1 text-sm font-medium text-slate-400">{unit}</span></p>
+          <p className="mt-2 text-[11px] text-slate-500">{note}</p>
+        </div>
+        <span className={`grid h-10 w-10 place-items-center rounded-xl ${accent} bg-opacity-10 text-lg`} aria-hidden="true">{icon}</span>
+      </div>
+    </Panel>
+  );
+}
+
+function Pill({ children, tone = "slate" }: { children: ReactNode; tone?: "slate" | "green" | "amber" | "red" | "blue" }) {
+  const tones = {
+    slate: "border-slate-700 bg-slate-800/80 text-slate-300",
+    green: "border-emerald-500/20 bg-emerald-500/10 text-emerald-300",
+    amber: "border-amber-500/20 bg-amber-500/10 text-amber-300",
+    red: "border-rose-500/20 bg-rose-500/10 text-rose-300",
+    blue: "border-cyan-500/20 bg-cyan-500/10 text-cyan-300",
+  };
+  return <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide ${tones[tone]}`}>{children}</span>;
+}
+
+function severityTone(severity: string): "red" | "amber" | "blue" {
+  const value = severity.toLowerCase();
+  return value === "critical" ? "red" : value === "warning" ? "amber" : "blue";
+}
 
 export default function Home() {
-  const [data, setData] = useState<DashboardData | null>(null);
+  const [tab, setTab] = useState<Tab>("overview");
+  const [token, setToken] = useState<string | null>(null);
+  const [user, setUser] = useState<User | null>(null);
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [loginError, setLoginError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [lastRefresh, setLastRefresh] = useState<string | null>(null);
+  const [refreshRate, setRefreshRate] = useState(15000);
+  const [instanceFilter, setInstanceFilter] = useState("all");
+  const [summary, setSummary] = useState<Summary | null>(null);
+  const [instances, setInstances] = useState<Instance[]>([]);
   const [history, setHistory] = useState<Metric[]>([]);
   const [incidents, setIncidents] = useState<Incident[]>([]);
-  const [error, setError] = useState("");
-
-  async function fetchDashboard() {
-    try {
-      const response = await fetch(
-        "/api/backend/v1/dashboard/summary",
-        { cache: "no-store" }
-      );
-
-      if (!response.ok) {
-        throw new Error("Failed to fetch dashboard data");
-      }
-
-      const result: DashboardData = await response.json();
-
-      setData(result);
-      setError("");
-    } catch (err) {
-      setError("Unable to connect to the backend");
-      console.error("Dashboard error:", err);
-    }
-  }
-
-  async function fetchHistory() {
-    try {
-      const response = await fetch(
-        "/api/backend/v1/metrics/history?limit=20",
-        { cache: "no-store" }
-      );
-
-      if (!response.ok) {
-        throw new Error("Failed to fetch metrics history");
-      }
-
-      const result: MetricsResponse = await response.json();
-
-      setHistory(result.metrics);
-    } catch (err) {
-      console.error("History error:", err);
-    }
-  }
-
-  async function fetchIncidents() {
-    try {
-      const response = await fetch(
-        "/api/backend/v1/incidents",
-        { cache: "no-store" }
-      );
-
-      if (!response.ok) {
-        throw new Error("Failed to fetch incidents");
-      }
-
-      const result: IncidentsResponse = await response.json();
-
-      setIncidents(result.incidents);
-    } catch (err) {
-      console.error("Incidents error:", err);
-    }
-  }
+  const [selectedIncident, setSelectedIncident] = useState<Incident | null>(null);
+  const [incidentReplay, setIncidentReplay] = useState<Replay | null>(null);
+  const [ml, setMl] = useState<MLStatus | null>(null);
+  const [anomalies, setAnomalies] = useState<Anomaly[]>([]);
+  const [costRecommendations, setCostRecommendations] = useState<CostRecommendation[]>([]);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [thresholds, setThresholds] = useState<Thresholds>(initialThresholds);
+  const [thresholdSaved, setThresholdSaved] = useState("");
+  const [incidentStatusFilter, setIncidentStatusFilter] = useState("all");
 
   useEffect(() => {
-    fetchDashboard();
-    fetchHistory();
-    fetchIncidents();
-
-    const interval = setInterval(() => {
-      fetchDashboard();
-      fetchHistory();
-      fetchIncidents();
-    }, 30000);
-
-    return () => clearInterval(interval);
+    const saved = window.sessionStorage.getItem("cloudpulse_token");
+    if (!saved) return;
+    api<User>("/auth/me", saved).then((profile) => {
+      setToken(saved);
+      setUser(profile);
+    }).catch(() => {
+      window.sessionStorage.removeItem("cloudpulse_token");
+    });
   }, []);
 
-  const healthScore = data
-    ? (() => {
-      const metrics = data.latest_metrics;
+  const loadDashboard = useCallback(async () => {
+    const scope = instanceFilter === "all" ? "" : `&instance_id=${encodeURIComponent(instanceFilter)}`;
+    const summaryPath = instanceFilter === "all" ? "/dashboard/summary" : `/dashboard/summary?instance_id=${encodeURIComponent(instanceFilter)}`;
+    const historyPath = `/metrics/history?limit=120${scope}`;
+    const incidentsPath = `/incidents?limit=100${scope}`;
+    const results = await Promise.allSettled([
+      api<Summary>(summaryPath),
+      api<{ instances: Instance[] }>("/instances"),
+      api<{ metrics: Metric[] }>(historyPath),
+      api<{ incidents: Incident[] }>(incidentsPath),
+      api<MLStatus>("/ml/status"),
+      api<{ anomalies: Anomaly[] }>(`/anomalies?limit=30${scope}`),
+      api<{ recommendations: CostRecommendation[] }>("/cost/recommendations?days=7"),
+      api<{ notifications: Notification[] }>("/notifications?limit=30"),
+      api<{ thresholds: Thresholds }>("/settings/thresholds"),
+    ]);
 
-      const cpuRisk = Math.min(
-        100,
-        Math.max(0, metrics.cpu_usage_percent)
+    const [summaryResult, instancesResult, historyResult, incidentResult, mlResult, anomaliesResult, costResult, notificationsResult, thresholdsResult] = results;
+    if (summaryResult.status === "fulfilled") setSummary(summaryResult.value);
+    else setSummary(null);
+    if (instancesResult.status === "fulfilled") setInstances(instancesResult.value.instances ?? []);
+    if (historyResult.status === "fulfilled") setHistory(historyResult.value.metrics ?? []);
+    if (incidentResult.status === "fulfilled") setIncidents(incidentResult.value.incidents ?? []);
+    if (mlResult.status === "fulfilled") setMl(mlResult.value);
+    if (anomaliesResult.status === "fulfilled") setAnomalies(anomaliesResult.value.anomalies ?? []);
+    if (costResult.status === "fulfilled") setCostRecommendations(costResult.value.recommendations ?? []);
+    if (notificationsResult.status === "fulfilled") setNotifications(notificationsResult.value.notifications ?? []);
+    if (thresholdsResult.status === "fulfilled") setThresholds(thresholdsResult.value.thresholds ?? initialThresholds);
+
+    if (summaryResult.status === "rejected") {
+      setError(summaryResult.reason instanceof Error ? summaryResult.reason.message : "Unable to load dashboard summary");
+    } else {
+      setError("");
+    }
+    setLastRefresh(new Date().toISOString());
+  }, [instanceFilter]);
+
+  useEffect(() => {
+    void loadDashboard();
+    if (refreshRate === 0) return;
+    const timer = window.setInterval(() => void loadDashboard(), refreshRate);
+    return () => window.clearInterval(timer);
+  }, [loadDashboard, refreshRate]);
+
+  const openIncident = async (incident: Incident) => {
+    setSelectedIncident(incident);
+    setIncidentReplay(null);
+    try {
+      const replay = await api<Replay>(`/incidents/${incident.id}/replay`, token);
+      setIncidentReplay(replay);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to load incident timeline");
+    }
+  };
+
+  const submitLogin = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setBusy(true);
+    setLoginError("");
+    try {
+      const result = await api<{ access_token: string; user: User }>("/auth/login", null, {
+        method: "POST",
+        body: JSON.stringify({ username, password }),
+      });
+      window.sessionStorage.setItem("cloudpulse_token", result.access_token);
+      setToken(result.access_token);
+      setUser(result.user);
+      setPassword("");
+      setLoginOpen(false);
+      await loadDashboard();
+    } catch (err) {
+      setLoginError(err instanceof Error ? err.message : "Sign-in failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const logout = () => {
+    window.sessionStorage.removeItem("cloudpulse_token");
+    setToken(null);
+    setUser(null);
+  };
+
+  const incidentAction = async (incident: Incident, action: "acknowledge" | "resolve") => {
+    if (!token) {
+      setLoginOpen(true);
+      setLoginError("Sign in as an analyst or admin to manage incidents.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = await api<{ incident?: Partial<Incident> }>(
+        `/incidents/${incident.id}/${action}`,
+        token,
+        { method: "PATCH" },
       );
+      await loadDashboard();
+      if (selectedIncident?.id === incident.id) {
+        const updatedIncident = { ...incident, ...(result.incident ?? {}) };
+        setSelectedIncident(updatedIncident);
+        const replay = await api<Replay>(`/incidents/${incident.id}/replay`, token);
+        setIncidentReplay(replay);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `Unable to ${action} incident`);
+    } finally {
+      setBusy(false);
+    }
+  };
 
-      const memoryRisk = Math.min(
-        100,
-        Math.max(0, metrics.memory_usage_percent)
-      );
+  const collectNow = async () => {
+    setBusy(true);
+    try {
+      await api("/metrics/collect", token, { method: "POST" });
+      await loadDashboard();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Metric collection failed");
+    } finally {
+      setBusy(false);
+    }
+  };
 
-      const latencyRisk =
-        metrics.latency_ms === null
-          ? 0
-          : Math.min(
-              100,
-              Math.max(0, (metrics.latency_ms / 1000) * 100)
-            );
+  const retrainModel = async () => {
+    if (!token) {
+      setLoginOpen(true);
+      setLoginError("Sign in as an analyst or admin to retrain the model.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = await api<{ message: string; samples: number }>("/ml/train", token, { method: "POST" });
+      setThresholdSaved(`Model trained with ${result.samples} historical samples.`);
+      await loadDashboard();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Model training failed");
+    } finally {
+      setBusy(false);
+    }
+  };
 
-      const errorRateRisk =
-        metrics.error_rate_percent === null
-          ? 0
-          : Math.min(
-              100,
-              Math.max(0, metrics.error_rate_percent * 10)
-            );
+  const saveThresholds = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (user?.role !== "admin" || !token) {
+      setLoginOpen(true);
+      setLoginError("Administrator sign-in is required to change alert thresholds.");
+      return;
+    }
+    setBusy(true);
+    setThresholdSaved("");
+    const body = {
+      cpu_warning: thresholds.cpu.warning,
+      cpu_critical: thresholds.cpu.critical,
+      memory_warning: thresholds.memory.warning,
+      memory_critical: thresholds.memory.critical,
+      disk_warning: thresholds.disk.warning,
+      disk_critical: thresholds.disk.critical,
+    };
+    try {
+      const result = await api<{ thresholds: Thresholds }>("/settings/thresholds", token, {
+        method: "PUT",
+        body: JSON.stringify(body),
+      });
+      setThresholds(result.thresholds);
+      setThresholdSaved("Thresholds saved. New metric collections will use these values.");
+      await loadDashboard();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to save thresholds");
+    } finally {
+      setBusy(false);
+    }
+  };
 
-      const trafficRisk =
-        metrics.request_rate === null
-          ? 0
-          : Math.min(
-              100,
-              Math.max(0, metrics.request_rate * 100)
-            );
-
-      const risk =
-        cpuRisk * 0.25 +
-        memoryRisk * 0.20 +
-        latencyRisk * 0.20 +
-        errorRateRisk * 0.20 +
-        trafficRisk * 0.15;
-
-      return Math.round(100 - risk);
-    })()
-  : null;
-
-  const healthStatus =
-    healthScore === null
-      ? "Loading..."
-      : healthScore >= 80
-        ? "Healthy"
-        : healthScore >= 60
-          ? "Degraded"
-          : healthScore >= 40
-            ? "Unhealthy"
-            : "Critical";
-
-  const riskScore = data
-    ? (() => {
-        const metrics = data.latest_metrics;
-
-        const cpuRisk = Math.min(
-          100,
-          Math.max(0, metrics.cpu_usage_percent)
-        );
-
-        const memoryRisk = Math.min(
-          100,
-          Math.max(0, metrics.memory_usage_percent)
-        );
-
-        const latencyRisk =
-          metrics.latency_ms === null
-            ? 0
-            : Math.min(
-                100,
-                Math.max(0, (metrics.latency_ms / 1000) * 100)
-              );
-
-        const errorRateRisk =
-          metrics.error_rate_percent === null
-            ? 0
-            : Math.min(
-                100,
-                Math.max(0, metrics.error_rate_percent * 10)
-              );
-
-        const trafficRisk =
-          metrics.request_rate === null
-            ? 0
-            : Math.min(
-                100,
-                Math.max(0, metrics.request_rate * 100)
-              );
-
-        return Math.round(
-          cpuRisk * 0.25 +
-            memoryRisk * 0.20 +
-            latencyRisk * 0.20 +
-            errorRateRisk * 0.20 +
-            trafficRisk * 0.15
-        );
-      })()
-    : null;
-
-  const riskStatus =
-    riskScore === null
-      ? "Loading..."
-      : riskScore < 30
-        ? "Low Risk"
-        : riskScore < 60
-          ? "Moderate Risk"
-          : riskScore < 80
-            ? "High Risk"
-            : "Critical Risk";
-
-  const chartData = history.map((metric) => ({
-    time: new Date(metric.timestamp).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    }),
+  const chartData = useMemo(() => [...history].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()).map((metric) => ({
+    time: new Date(metric.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
     cpu: metric.cpu_usage_percent,
     memory: metric.memory_usage_percent,
     disk: metric.disk_usage_percent,
-  }));
+  })), [history]);
 
-  const getSeverityStyle = (severity: string) => {
-    if (severity.toLowerCase() === "critical") {
-      return "bg-red-950 text-red-400";
-    }
+  const current = summary?.latest_metrics;
+  const healthScore = current
+    ? Math.round(100 - Math.min(100, current.cpu_usage_percent * 0.25 + current.memory_usage_percent * 0.2 + (current.latency_ms ?? 0) / 10 * 0.2 + (current.error_rate_percent ?? 0) * 0.2 + (current.request_rate ?? 0) * 15))
+    : null;
+  const healthTone = healthScore === null ? "slate" : healthScore >= 80 ? "green" : healthScore >= 60 ? "amber" : "red";
+  const openIncidents = summary?.incidents.open ?? incidents.filter((incident) => incident.status === "open").length;
+  const criticalIncidents = incidents.filter((incident) => incident.status === "open" && incident.severity.toLowerCase() === "critical").length;
+  const visibleIncidents = incidentStatusFilter === "all" ? incidents : incidents.filter((incident) => incident.status === incidentStatusFilter);
 
-    return "bg-yellow-950 text-yellow-400";
-  };
-
-  const getStatusStyle = (status: string) => {
-    if (status.toLowerCase() === "resolved") {
-      return "bg-green-950 text-green-400";
-    }
-
-    return "bg-orange-950 text-orange-400";
+  const updateThreshold = (metric: keyof Thresholds, kind: "warning" | "critical", value: string) => {
+    const parsed = Number(value);
+    setThresholds((currentValue) => ({
+      ...currentValue,
+      [metric]: { ...currentValue[metric], [kind]: Number.isFinite(parsed) ? parsed : 0 },
+    }));
   };
 
   return (
-    <main className="min-h-screen bg-slate-950 p-4 text-white sm:p-8">
-      <div className="mx-auto max-w-7xl">
-
-        {/* Header */}
-        <div className="mb-8">
-          <p className="text-sm font-semibold tracking-wider text-cyan-400">
-            CLOUDPULSE SENTINEL
-          </p>
-
-          <h1 className="mt-2 text-3xl font-bold sm:text-4xl">
-            Cloud Operations Dashboard
-          </h1>
-
-          <p className="mt-2 text-slate-400">
-            Monitor your AWS infrastructure in real time.
-          </p>
-        </div>
-
-        {/* Error */}
-        {error && (
-          <div className="mb-6 rounded-xl border border-red-800 bg-red-950 p-4 text-red-300">
-            {error}
-          </div>
-        )}
-        {/* Cloud Health Score */}
-        <div className="mb-6 rounded-xl border border-slate-800 bg-slate-900 p-6">
-          <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
-            <div className="w-full">
-              <p className="text-sm font-semibold tracking-wider text-slate-400">
-                CLOUD HEALTH SCORE
-              </p>
-
-              <p className="mt-2 text-sm text-slate-400">
-                Based on CPU, memory, latency, error rate, and traffic behavior.
-              </p>
-
-              <div className="mt-5 grid grid-cols-2 gap-4 text-sm sm:grid-cols-5">
-                <div>
-                  <p className="text-slate-500">CPU</p>
-                  <p className="mt-1 font-semibold text-cyan-400">
-                    {data ? `${data.latest_metrics.cpu_usage_percent}%` : "--"}
-                  </p>
-                  <p className="text-xs text-slate-600">25% weight</p>
-                </div>
-
-                <div>
-                  <p className="text-slate-500">Memory</p>
-                  <p className="mt-1 font-semibold text-blue-400">
-                    {data ? `${data.latest_metrics.memory_usage_percent}%` : "--"}
-                  </p>
-                  <p className="text-xs text-slate-600">20% weight</p>
-                </div>
-
-                <div>
-                  <p className="text-slate-500">Latency</p>
-                  <p className="mt-1 font-semibold text-purple-400">
-                    {data?.latest_metrics.latency_ms !== null &&
-                    data?.latest_metrics.latency_ms !== undefined
-                      ? `${data.latest_metrics.latency_ms} ms`
-                      : "--"}
-                  </p>
-                  <p className="text-xs text-slate-600">20% weight</p>
-                </div>
-
-                <div>
-                  <p className="text-slate-500">Error Rate</p>
-                  <p className="mt-1 font-semibold text-red-400">
-                    {data?.latest_metrics.error_rate_percent !== null &&
-                    data?.latest_metrics.error_rate_percent !== undefined
-                      ? `${data.latest_metrics.error_rate_percent}%`
-                      : "--"}
-                  </p>
-                  <p className="text-xs text-slate-600">20% weight</p>
-                </div>
-
-                <div>
-                  <p className="text-slate-500">Traffic</p>
-                  <p className="mt-1 font-semibold text-yellow-400">
-                    {data?.latest_metrics.request_rate !== null &&
-                    data?.latest_metrics.request_rate !== undefined
-                      ? `${data.latest_metrics.request_rate} req/s`
-                      : "--"}
-                  </p>
-                  <p className="text-xs text-slate-600">15% weight</p>
-                </div>
-              </div>
-            </div>
-
-            <div className="min-w-[150px] text-left sm:text-right">
-              <div className="text-5xl font-bold text-cyan-400">
-                {healthScore !== null ? `${healthScore}/100` : "--"}
-              </div>
-
-              <p className="mt-1 text-sm font-semibold uppercase tracking-wider text-slate-300">
-                {healthStatus}
-              </p>
+    <main className="min-h-screen bg-[#070b14] text-slate-100">
+      <div className="pointer-events-none fixed inset-0 overflow-hidden">
+        <div className="absolute -left-40 -top-40 h-[32rem] w-[32rem] rounded-full bg-cyan-500/[0.06] blur-3xl" />
+        <div className="absolute right-0 top-1/3 h-[28rem] w-[28rem] rounded-full bg-blue-500/[0.05] blur-3xl" />
+      </div>
+      <div className="relative mx-auto flex min-h-screen max-w-[1600px] flex-col lg:flex-row">
+        <aside className="border-b border-slate-800 bg-[#0a1020]/90 p-4 backdrop-blur-xl lg:sticky lg:top-0 lg:h-screen lg:w-64 lg:shrink-0 lg:border-b-0 lg:border-r lg:p-5">
+          <div className="flex items-center gap-3">
+            <div className="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-cyan-400 to-blue-600 text-lg font-black text-slate-950 shadow-lg shadow-cyan-500/20">C</div>
+            <div>
+              <p className="text-sm font-bold tracking-wide text-white">CLOUDPULSE</p>
+              <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-cyan-400">Sentinel / AIOps</p>
             </div>
           </div>
-
-          <div className="mt-6 h-2 overflow-hidden rounded-full bg-slate-800">
-            <div
-              className="h-full rounded-full bg-cyan-400 transition-all duration-500"
-              style={{ width: `${healthScore ?? 0}%` }}
-            />
+          <div className="mt-8 hidden lg:block">
+            <p className="mb-3 px-3 text-[10px] font-bold uppercase tracking-[0.2em] text-slate-600">Workspace</p>
+            <nav className="space-y-1" aria-label="Dashboard sections">
+              {([
+                ["overview", "◫", "Overview"],
+                ["incidents", "⚑", "Incidents"],
+                ["ml", "✳", "ML & Cost"],
+                ["settings", "⚙", "Settings"],
+              ] as [Tab, string, string][]).map(([key, icon, label]) => (
+                <button key={key} onClick={() => setTab(key)} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition ${tab === key ? "bg-cyan-400/10 font-semibold text-cyan-300 ring-1 ring-cyan-400/20" : "text-slate-400 hover:bg-slate-800/70 hover:text-white"}`}>
+                  <span className="w-5 text-center text-base">{icon}</span>{label}
+                  {key === "incidents" && openIncidents > 0 && <span className="ml-auto rounded-full bg-rose-500/15 px-2 py-0.5 text-[10px] text-rose-300">{openIncidents}</span>}
+                </button>
+              ))}
+            </nav>
           </div>
-        </div>
-        {/* Incident Risk */}
-        <div className="mb-6 rounded-xl border border-slate-800 bg-slate-900 p-6">
-          <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
-            <div className="w-full">
-              <p className="text-sm font-semibold tracking-wider text-slate-400">
-                INCIDENT RISK
-              </p>
-
-              <p className="mt-2 text-sm text-slate-400">
-                Based on CPU, memory, latency, error rate, and traffic behavior.
-              </p>
-
-              <div className="mt-5 grid grid-cols-2 gap-4 text-sm sm:grid-cols-5">
-                <div>
-                  <p className="text-slate-500">CPU</p>
-                  <p className="mt-1 font-semibold text-cyan-400">
-                    {data ? `${data.latest_metrics.cpu_usage_percent}%` : "--"}
-                  </p>
-                  <p className="text-xs text-slate-600">25% weight</p>
-                </div>
-
-                <div>
-                  <p className="text-slate-500">Memory</p>
-                  <p className="mt-1 font-semibold text-blue-400">
-                    {data ? `${data.latest_metrics.memory_usage_percent}%` : "--"}
-                  </p>
-                  <p className="text-xs text-slate-600">20% weight</p>
-                </div>
-
-                <div>
-                  <p className="text-slate-500">Latency</p>
-                  <p className="mt-1 font-semibold text-purple-400">
-                    {data?.latest_metrics.latency_ms !== null &&
-                    data?.latest_metrics.latency_ms !== undefined
-                      ? `${data.latest_metrics.latency_ms} ms`
-                      : "--"}
-                  </p>
-                  <p className="text-xs text-slate-600">20% weight</p>
-                </div>
-
-                <div>
-                  <p className="text-slate-500">Error Rate</p>
-                  <p className="mt-1 font-semibold text-red-400">
-                    {data?.latest_metrics.error_rate_percent !== null &&
-                    data?.latest_metrics.error_rate_percent !== undefined
-                      ? `${data.latest_metrics.error_rate_percent}%`
-                      : "--"}
-                  </p>
-                  <p className="text-xs text-slate-600">20% weight</p>
-                </div>
-
-                <div>
-                  <p className="text-slate-500">Traffic</p>
-                  <p className="mt-1 font-semibold text-yellow-400">
-                    {data?.latest_metrics.request_rate !== null &&
-                    data?.latest_metrics.request_rate !== undefined
-                      ? `${data.latest_metrics.request_rate} req/s`
-                      : "--"}
-                  </p>
-                  <p className="text-xs text-slate-600">15% weight</p>
-                </div>
+          <div className="mt-4 flex gap-2 overflow-x-auto lg:hidden">
+            {([
+              ["overview", "Overview"], ["incidents", "Incidents"], ["ml", "ML & Cost"], ["settings", "Settings"],
+            ] as [Tab, string][]).map(([key, label]) => <button key={key} onClick={() => setTab(key)} className={`whitespace-nowrap rounded-lg px-3 py-2 text-xs font-semibold ${tab === key ? "bg-cyan-400/15 text-cyan-200" : "bg-slate-900 text-slate-400"}`}>{label}</button>)}
+          </div>
+          <div className="mt-8 hidden rounded-xl border border-slate-800 bg-slate-900/70 p-4 lg:block">
+            <div className="flex items-center gap-2 text-xs font-semibold text-slate-300"><span className="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_10px_#34d399]" /> API workspace</div>
+            <p className="mt-2 text-[11px] leading-5 text-slate-500">Local-first monitoring. Cloud delivery channels activate when configured.</p>
+            <p className="mt-3 break-all font-mono text-[10px] text-slate-600">{instanceFilter === "all" ? `${instances.length} instances` : instanceFilter}</p>
+          </div>
+          <div className="mt-8 border-t border-slate-800 pt-4 lg:mt-auto lg:border-0">
+            {user ? (
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0"><p className="truncate text-xs font-semibold text-white">{user.full_name || user.username}</p><p className="text-[10px] uppercase tracking-wider text-slate-500">{user.role}</p></div>
+                <button onClick={logout} className="rounded-lg border border-slate-700 px-2.5 py-1.5 text-[10px] text-slate-400 hover:border-slate-500 hover:text-white">Sign out</button>
               </div>
-            </div>
-
-            <div className="min-w-[150px] text-left sm:text-right">
-              <div className="text-5xl font-bold text-yellow-400">
-                {riskScore !== null ? `${riskScore}/100` : "--"}
-              </div>
-
-              <p className="mt-1 text-sm font-semibold uppercase tracking-wider text-slate-300">
-                {riskStatus}
-              </p>
-            </div>
-          </div>
-
-          <div className="mt-6 h-2 overflow-hidden rounded-full bg-slate-800">
-            <div
-              className="h-full rounded-full bg-yellow-400 transition-all duration-500"
-              style={{ width: `${riskScore ?? 0}%` }}
-            />
-          </div>
-        </div>
-
-        {/* Instance Information */}
-        <div className="mb-6 rounded-xl border border-slate-800 bg-slate-900 p-5">
-          <p className="text-sm text-slate-400">
-            EC2 Instance
-          </p>
-
-          <h2 className="mt-2 break-all font-mono text-lg">
-            {data?.instance_id || "Loading..."}
-          </h2>
-
-          <p className="mt-2 text-sm text-green-400">
-            ● Connected to backend
-          </p>
-        </div>
-
-        {/* Resource Cards */}
-        <div className="grid gap-6 md:grid-cols-3">
-
-          <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
-            <p className="text-sm text-slate-400">
-              CPU Usage
-            </p>
-
-            <h2 className="mt-3 text-4xl font-bold text-cyan-400">
-              {data
-                ? `${data.latest_metrics.cpu_usage_percent}%`
-                : "--"}
-            </h2>
-          </div>
-
-          <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
-            <p className="text-sm text-slate-400">
-              Memory Usage
-            </p>
-
-            <h2 className="mt-3 text-4xl font-bold text-green-400">
-              {data
-                ? `${data.latest_metrics.memory_usage_percent}%`
-                : "--"}
-            </h2>
-          </div>
-
-          <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
-            <p className="text-sm text-slate-400">
-              Disk Usage
-            </p>
-
-            <h2 className="mt-3 text-4xl font-bold text-purple-400">
-              {data
-                ? `${data.latest_metrics.disk_usage_percent}%`
-                : "--"}
-            </h2>
-          </div>
-
-        </div>
-
-        {/* Incident Summary Cards */}
-        <div className="mt-6 grid gap-6 md:grid-cols-2">
-
-          <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
-            <p className="text-sm text-slate-400">
-              Open Incidents
-            </p>
-
-            <h2 className="mt-3 text-4xl font-bold text-yellow-400">
-              {data ? data.incidents.open : "--"}
-            </h2>
-          </div>
-
-          <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
-            <p className="text-sm text-slate-400">
-              Total Incidents
-            </p>
-
-            <h2 className="mt-3 text-4xl font-bold text-orange-400">
-              {data ? data.incidents.total : "--"}
-            </h2>
-          </div>
-
-        </div>
-
-        {/* Resource Usage Chart */}
-        <div className="mt-6 rounded-xl border border-slate-800 bg-slate-900 p-6">
-
-          <h2 className="mb-6 text-xl font-semibold">
-            Resource Usage History
-          </h2>
-
-          <div className="h-80 w-full">
-
-            {chartData.length > 0 ? (
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={chartData}>
-
-                  <CartesianGrid
-                    strokeDasharray="3 3"
-                    stroke="#334155"
-                  />
-
-                  <XAxis
-                    dataKey="time"
-                    stroke="#94a3b8"
-                  />
-
-                  <YAxis
-                    domain={[0, 100]}
-                    stroke="#94a3b8"
-                  />
-
-                  <Tooltip
-                    contentStyle={{
-                      backgroundColor: "#0f172a",
-                      border: "1px solid #334155",
-                      borderRadius: "8px",
-                      color: "#ffffff",
-                    }}
-                  />
-
-                  <Legend />
-
-                  <Line
-                    type="monotone"
-                    dataKey="cpu"
-                    name="CPU %"
-                    stroke="#22d3ee"
-                    strokeWidth={2}
-                    dot={false}
-                  />
-
-                  <Line
-                    type="monotone"
-                    dataKey="memory"
-                    name="Memory %"
-                    stroke="#4ade80"
-                    strokeWidth={2}
-                    dot={false}
-                  />
-
-                  <Line
-                    type="monotone"
-                    dataKey="disk"
-                    name="Disk %"
-                    stroke="#c084fc"
-                    strokeWidth={2}
-                    dot={false}
-                  />
-
-                </LineChart>
-              </ResponsiveContainer>
             ) : (
-              <div className="flex h-full items-center justify-center text-slate-400">
-                Loading metrics history...
-              </div>
+              <button onClick={() => setLoginOpen((value) => !value)} className="w-full rounded-xl border border-slate-700 bg-slate-900 px-3 py-2.5 text-xs font-semibold text-slate-200 hover:border-cyan-400/40 hover:text-cyan-200">Sign in for actions</button>
             )}
-
           </div>
-        </div>
+        </aside>
 
-        {/* Incident Dashboard */}
-        <div className="mt-6 rounded-xl border border-slate-800 bg-slate-900 p-6">
+        <section className="min-w-0 flex-1 p-4 sm:p-6 lg:p-8">
+          <header className="mb-7 flex flex-col justify-between gap-4 border-b border-slate-800/80 pb-6 sm:flex-row sm:items-end">
+            <div>
+              <p className="text-[10px] font-bold uppercase tracking-[0.24em] text-cyan-400">Operations command center</p>
+              <h1 className="mt-2 text-2xl font-semibold tracking-tight text-white sm:text-3xl">{tab === "overview" ? "Infrastructure overview" : tab === "incidents" ? "Incident management" : tab === "ml" ? "Intelligence & optimization" : "Platform settings"}</h1>
+              <p className="mt-1 text-sm text-slate-500">{tab === "overview" ? "Live health, resource utilization and fleet visibility." : tab === "incidents" ? "Triage, acknowledge and resolve operational events." : tab === "ml" ? "Model transparency, anomaly history and utilization insights." : "Tune alert thresholds and review notification delivery."}</p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="sr-only" htmlFor="instance-filter">Instance filter</label>
+              <select id="instance-filter" value={instanceFilter} onChange={(event) => setInstanceFilter(event.target.value)} className="rounded-xl border border-slate-700 bg-slate-900 px-3 py-2.5 text-xs text-slate-200 outline-none focus:border-cyan-400">
+                <option value="all">All instances</option>
+                {instances.map((instance) => <option key={instance.instance_id} value={instance.instance_id}>{instance.instance_id}</option>)}
+              </select>
+              <label className="sr-only" htmlFor="refresh-rate">Refresh interval</label>
+              <select id="refresh-rate" value={refreshRate} onChange={(event) => setRefreshRate(Number(event.target.value))} className="rounded-xl border border-slate-700 bg-slate-900 px-3 py-2.5 text-xs text-slate-200 outline-none focus:border-cyan-400">
+                <option value={10000}>Refresh · 10s</option><option value={15000}>Refresh · 15s</option><option value={30000}>Refresh · 30s</option><option value={0}>Refresh · off</option>
+              </select>
+              <button onClick={() => void collectNow()} disabled={busy} className="rounded-xl border border-emerald-400/30 bg-emerald-400/10 px-3 py-2.5 text-xs font-semibold text-emerald-200 hover:bg-emerald-400/15 disabled:opacity-50">＋ Collect now</button>
+              <button onClick={() => void loadDashboard()} className="rounded-xl border border-cyan-400/30 bg-cyan-400/10 px-3 py-2.5 text-xs font-semibold text-cyan-200 hover:bg-cyan-400/15">↻ Refresh</button>
+            </div>
+          </header>
 
-          <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
-            <h2 className="text-xl font-semibold">
-              Incident Dashboard
-            </h2>
+          {error && <div role="alert" className="mb-5 flex items-center justify-between gap-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200"><span>{error}</span><button onClick={() => setError("")} className="text-rose-300">Dismiss</button></div>}
+          {loginOpen && (
+            <Panel className="mb-6 border-cyan-500/30">
+              <div className="mb-3 flex items-center justify-between"><div><p className="text-sm font-semibold text-white">Sign in to CloudPulse</p><p className="text-xs text-slate-500">Incident actions and model retraining require an authorized account.</p></div><button onClick={() => setLoginOpen(false)} className="text-slate-500 hover:text-white" aria-label="Close sign in">✕</button></div>
+              <form onSubmit={submitLogin} className="grid gap-3 sm:grid-cols-[1fr_1fr_auto]">
+                <input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="Username" autoComplete="username" required className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm outline-none focus:border-cyan-400" />
+                <input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Password" type="password" autoComplete="current-password" required className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm outline-none focus:border-cyan-400" />
+                <button disabled={busy} className="rounded-xl bg-cyan-400 px-5 py-2.5 text-sm font-bold text-slate-950 disabled:opacity-50">{busy ? "Signing in…" : "Sign in"}</button>
+              </form>
+              {loginError && <p className="mt-2 text-xs text-rose-300">{loginError}</p>}
+            </Panel>
+          )}
 
-            <span className="rounded-full bg-slate-800 px-3 py-1 text-sm text-slate-300">
-              {incidents.length} incidents
-            </span>
-          </div>
+          {tab === "overview" && (
+            <div className="space-y-6">
+              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+                <MetricCard label="Infrastructure health" value={healthScore === null ? "—" : String(healthScore)} unit="/ 100" note={healthTone === "green" ? "Heuristic indicator · healthy range" : healthTone === "amber" ? "Heuristic indicator · monitor pressure" : healthTone === "red" ? "Heuristic indicator · operator attention" : "Waiting for telemetry"} accent="bg-cyan-400" icon="◈" />
+                <MetricCard label="Open incidents" value={String(openIncidents)} note={`${criticalIncidents} critical · ${incidents.length} in current view`} accent="bg-rose-400" icon="⚑" />
+                <MetricCard label="Monitored instances" value={String(instances.length)} note="Instances with at least one stored sample" accent="bg-blue-400" icon="▤" />
+                <MetricCard label="ML anomaly events" value={String(ml?.anomaly_count ?? 0)} note={ml?.is_trained ? `Model ${ml.model_version} active` : "Model training required"} accent="bg-violet-400" icon="✳" />
+              </div>
 
-          {incidents.length === 0 ? (
-            <p className="text-slate-400">
-              No incidents detected.
-            </p>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[850px] text-left text-sm">
+              <div className="grid gap-4 xl:grid-cols-[1.7fr_1fr]">
+                <Panel>
+                  <SectionTitle eyebrow="Resource telemetry" title="Utilization over time" description={`${history.length} stored samples · ${instanceFilter === "all" ? "all instances" : instanceFilter}`} action={<Pill tone="blue">Auto refresh {refreshRate === 0 ? "off" : `${refreshRate / 1000}s`}</Pill>} />
+                  <div className="h-[300px] w-full">
+                    {chartData.length ? <ResponsiveContainer width="100%" height="100%"><LineChart data={chartData} margin={{ top: 8, right: 12, left: -18, bottom: 0 }}>
+                      <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} />
+                      <XAxis dataKey="time" tick={{ fill: "#64748b", fontSize: 10 }} axisLine={false} tickLine={false} minTickGap={24} />
+                      <YAxis domain={[0, 100]} tick={{ fill: "#64748b", fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={(value) => `${value}%`} />
+                      <Tooltip contentStyle={{ background: "#0b1220", border: "1px solid #334155", borderRadius: 12, color: "#e2e8f0" }} formatter={(value) => [`${Number(value).toFixed(1)}%`]} />
+                      <Legend wrapperStyle={{ color: "#94a3b8", fontSize: 11 }} />
+                      <Line type="monotone" dataKey="cpu" name="CPU" stroke="#22d3ee" strokeWidth={2.5} dot={false} activeDot={{ r: 4 }} />
+                      <Line type="monotone" dataKey="memory" name="Memory" stroke="#818cf8" strokeWidth={2.5} dot={false} activeDot={{ r: 4 }} />
+                      <Line type="monotone" dataKey="disk" name="Disk" stroke="#34d399" strokeWidth={2.5} dot={false} activeDot={{ r: 4 }} />
+                    </LineChart></ResponsiveContainer> : <div className="grid h-full place-items-center rounded-xl border border-dashed border-slate-800 text-sm text-slate-500">No metric history yet. Collect metrics or connect an instance agent.</div>}
+                  </div>
+                </Panel>
+                <Panel>
+                  <SectionTitle eyebrow="Current snapshot" title={summary?.instance_id ?? "Awaiting telemetry"} description={current ? `Last sample ${new Date(current.timestamp).toLocaleTimeString()}` : "No sample available for this filter"} />
+                  <div className="space-y-5">
+                    {([
+                      ["CPU", current?.cpu_usage_percent, "#22d3ee"],
+                      ["Memory", current?.memory_usage_percent, "#818cf8"],
+                      ["Disk", current?.disk_usage_percent, "#34d399"],
+                    ] as [string, number | undefined, string][]).map(([label, value, color]) => <div key={label}>
+                      <div className="mb-2 flex justify-between text-xs"><span className="text-slate-400">{label}</span><span className="font-semibold text-slate-200">{value === undefined ? "—" : `${value.toFixed(1)}%`}</span></div>
+                      <div className="h-2 overflow-hidden rounded-full bg-slate-800"><div className="h-full rounded-full transition-all" style={{ width: `${Math.max(0, Math.min(100, value ?? 0))}%`, backgroundColor: color }} /></div>
+                    </div>)}
+                    <div className="grid grid-cols-2 gap-3 border-t border-slate-800 pt-4">
+                      <div><p className="text-[10px] uppercase tracking-wider text-slate-500">API latency</p><p className="mt-1 text-lg font-semibold text-white">{current?.latency_ms == null ? "—" : `${current.latency_ms} ms`}</p></div>
+                      <div><p className="text-[10px] uppercase tracking-wider text-slate-500">Error rate</p><p className="mt-1 text-lg font-semibold text-white">{current?.error_rate_percent == null ? "—" : `${current.error_rate_percent}%`}</p></div>
+                    </div>
+                  </div>
+                </Panel>
+              </div>
 
-                <thead className="border-b border-slate-700 text-slate-400">
-                  <tr>
-                    <th className="px-4 py-3">Incident</th>
-                    <th className="px-4 py-3">Severity</th>
-                    <th className="px-4 py-3">Status</th>
-                    <th className="px-4 py-3">Value</th>
-                    <th className="px-4 py-3">Detected</th>
-                  </tr>
-                </thead>
+              <Panel>
+                <SectionTitle eyebrow="Fleet inventory" title="Monitored instances" description="Latest resource readings per reporting instance." action={<Pill>{instances.length} registered</Pill>} />
+                {instances.length === 0 ? <p className="text-sm text-slate-500">No instances have reported metrics yet. Configure an instance agent to populate this list.</p> : <div className="overflow-x-auto"><table className="w-full min-w-[700px] text-left text-xs"><thead className="border-b border-slate-800 text-[10px] uppercase tracking-wider text-slate-500"><tr><th className="pb-3">Instance</th><th className="pb-3">CPU</th><th className="pb-3">Memory</th><th className="pb-3">Disk</th><th className="pb-3">Open incidents</th><th className="pb-3">Last seen</th></tr></thead><tbody>{instances.map((instance) => <tr key={instance.instance_id} className="border-b border-slate-800/70 last:border-0"><td className="py-3 pr-3 font-mono text-cyan-200">{instance.instance_id}</td><td className="py-3">{instance.cpu_usage_percent.toFixed(1)}%</td><td className="py-3">{instance.memory_usage_percent.toFixed(1)}%</td><td className="py-3">{instance.disk_usage_percent.toFixed(1)}%</td><td className="py-3"><Pill tone={instance.open_incidents ? "amber" : "green"}>{instance.open_incidents}</Pill></td><td className="py-3 text-slate-500">{new Date(instance.last_seen).toLocaleString()}</td></tr>)}</tbody></table></div>}
+              </Panel>
 
-                <tbody>
-                  {incidents.map((incident) => (
-                    <tr
-                      key={incident.id}
-                      className="border-b border-slate-800"
-                    >
-
-                      <td className="px-4 py-4">
-                        <p className="font-semibold text-white">
-                          {incident.title}
-                        </p>
-
-                        <p className="mt-1 max-w-md text-xs text-slate-400">
-                          {incident.description}
-                        </p>
-
-                        <p className="mt-1 text-xs text-slate-500">
-                          {incident.incident_type}
-                        </p>
-                      </td>
-
-                      <td className="px-4 py-4">
-                        <span
-                          className={`rounded-full px-3 py-1 text-xs font-semibold ${getSeverityStyle(
-                            incident.severity
-                          )}`}
-                        >
-                          {incident.severity.toUpperCase()}
-                        </span>
-                      </td>
-
-                      <td className="px-4 py-4">
-                        <span
-                          className={`rounded-full px-3 py-1 text-xs font-semibold ${getStatusStyle(
-                            incident.status
-                          )}`}
-                        >
-                          {incident.status.toUpperCase()}
-                        </span>
-                      </td>
-
-                      <td className="px-4 py-4 text-slate-300">
-                        {incident.metric_value}%
-
-                        <span className="text-xs text-slate-500">
-                          {" "}
-                          / {incident.threshold_value}%
-                        </span>
-                      </td>
-
-                      <td className="whitespace-nowrap px-4 py-4 text-slate-400">
-                        {new Date(
-                          incident.detected_at
-                        ).toLocaleString()}
-                      </td>
-
-                    </tr>
-                  ))}
-                </tbody>
-
-              </table>
+              <div className="grid gap-4 xl:grid-cols-2">
+                <Panel>
+                  <SectionTitle eyebrow="Attention required" title="Recent active incidents" action={<button onClick={() => setTab("incidents")} className="text-xs font-semibold text-cyan-300 hover:text-cyan-200">View all →</button>} />
+                  {incidents.filter((item) => item.status === "open").slice(0, 4).length === 0 ? <p className="text-sm text-slate-500">No active incidents in the selected scope.</p> : <div className="space-y-3">{incidents.filter((item) => item.status === "open").slice(0, 4).map((incident) => <button key={incident.id} onClick={() => { setTab("incidents"); void openIncident(incident); }} className="flex w-full items-center gap-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-left transition hover:border-slate-700"><span className={`h-2.5 w-2.5 shrink-0 rounded-full ${incident.severity === "critical" ? "bg-rose-400" : incident.severity === "warning" ? "bg-amber-400" : "bg-cyan-400"}`} /><span className="min-w-0 flex-1"><span className="block truncate text-xs font-semibold text-slate-200">{incident.title}</span><span className="mt-1 block truncate text-[10px] text-slate-500">{incident.instance_id} · {new Date(incident.detected_at).toLocaleString()}</span></span><Pill tone={severityTone(incident.severity)}>{incident.severity}</Pill></button>)}</div>}
+                </Panel>
+                <Panel>
+                  <SectionTitle eyebrow="ML signal" title="Anomaly detection" action={<Pill tone={ml?.is_trained ? "green" : "amber"}>{ml?.is_trained ? "Model active" : "Not trained"}</Pill>} />
+                  <div className="grid grid-cols-2 gap-3"><div className="rounded-xl bg-slate-950/70 p-4"><p className="text-[10px] uppercase tracking-wider text-slate-500">Training samples</p><p className="mt-2 text-2xl font-semibold text-white">{ml?.training_samples ?? "—"}</p></div><div className="rounded-xl bg-slate-950/70 p-4"><p className="text-[10px] uppercase tracking-wider text-slate-500">Anomalies detected</p><p className="mt-2 text-2xl font-semibold text-white">{ml?.anomaly_count ?? "—"}</p></div></div>
+                  <button onClick={() => setTab("ml")} className="mt-4 text-xs font-semibold text-cyan-300 hover:text-cyan-200">Explore model insights →</button>
+                </Panel>
+              </div>
+              <p className="text-right text-[10px] text-slate-600">Last dashboard refresh: {lastRefresh ? new Date(lastRefresh).toLocaleTimeString() : "—"}</p>
             </div>
           )}
 
-        </div>
+          {tab === "incidents" && (
+            <div className="grid gap-5 2xl:grid-cols-[1.35fr_1fr]">
+              <Panel>
+                <SectionTitle eyebrow="Incident response" title="Incident queue" description={`${incidents.length} incidents in selected scope`} action={<select value={incidentStatusFilter} onChange={(event) => setIncidentStatusFilter(event.target.value)} className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-300"><option value="all">All statuses</option><option value="open">Open</option><option value="resolved">Resolved</option></select>} />
+                <div className="space-y-2">{visibleIncidents.length === 0 ? <p className="rounded-xl border border-dashed border-slate-800 p-8 text-center text-sm text-slate-500">No incidents match this filter.</p> : visibleIncidents.map((incident) => <button key={incident.id} onClick={() => void openIncident(incident)} className={`w-full rounded-xl border p-4 text-left transition ${selectedIncident?.id === incident.id ? "border-cyan-400/40 bg-cyan-400/[0.06]" : "border-slate-800 bg-slate-950/50 hover:border-slate-700"}`}>
+                  <div className="flex flex-wrap items-center justify-between gap-2"><div className="flex items-center gap-2"><Pill tone={severityTone(incident.severity)}>{incident.severity}</Pill><span className="text-[10px] text-slate-600">INC-{incident.id}</span></div><Pill tone={incident.status === "resolved" ? "green" : incident.acknowledged_at ? "blue" : "amber"}>{incident.status === "resolved" ? "Resolved" : incident.acknowledged_at ? "Acknowledged" : "Open"}</Pill></div>
+                  <p className="mt-3 text-sm font-semibold text-white">{incident.title}</p><p className="mt-1 text-xs text-slate-500">{incident.instance_id} · {incident.incident_type}</p><p className="mt-2 line-clamp-2 text-xs text-slate-400">{incident.description}</p><p className="mt-3 text-[10px] text-slate-600">{new Date(incident.detected_at).toLocaleString()} · Metric {incident.metric_value}% / threshold {incident.threshold_value}%</p>
+                </button>)}</div>
+              </Panel>
+              <Panel className="h-fit">
+                <SectionTitle eyebrow="Event trace" title={selectedIncident ? `Incident #${selectedIncident.id}` : "Select an incident"} description="Detection, acknowledgement, notification and resolution events." />
+                {selectedIncident ? <>
+                  <p className="text-sm font-semibold text-white">{selectedIncident.title}</p><p className="mt-1 text-xs leading-5 text-slate-400">{selectedIncident.description}</p>
+                  <div className="mt-4 grid grid-cols-2 gap-2"><div className="rounded-lg bg-slate-950 p-3"><p className="text-[10px] text-slate-500">Metric value</p><p className="mt-1 text-lg font-semibold">{selectedIncident.metric_value}%</p></div><div className="rounded-lg bg-slate-950 p-3"><p className="text-[10px] text-slate-500">Threshold</p><p className="mt-1 text-lg font-semibold">{selectedIncident.threshold_value}%</p></div></div>
+                  {selectedIncident.status === "open" && <div className="mt-4 flex flex-wrap gap-2">{!selectedIncident.acknowledged_at && <button disabled={busy || !token} onClick={() => void incidentAction(selectedIncident, "acknowledge")} className="rounded-lg border border-cyan-400/30 bg-cyan-400/10 px-3 py-2 text-xs font-semibold text-cyan-200 disabled:opacity-40">Acknowledge</button>}<button disabled={busy || !token} onClick={() => void incidentAction(selectedIncident, "resolve")} className="rounded-lg bg-emerald-500/15 px-3 py-2 text-xs font-semibold text-emerald-300 disabled:opacity-40">Resolve incident</button></div>}
+                  {!token && <p className="mt-2 text-[10px] text-slate-600">Sign in to enable incident actions.</p>}
+                  {selectedIncident.acknowledged_at && <p className="mt-3 text-xs text-cyan-300">Acknowledged by {selectedIncident.acknowledged_by} · {new Date(selectedIncident.acknowledged_at).toLocaleString()}</p>}
+                  <div className="mt-6"><p className="mb-4 text-[10px] font-bold uppercase tracking-[0.2em] text-slate-500">Timeline</p>{incidentReplay?.timeline?.length ? <div className="space-y-4">{incidentReplay.timeline.map((event, index) => <div key={event.id} className="relative flex gap-3"><div className="flex flex-col items-center"><span className="mt-1 h-2.5 w-2.5 rounded-full bg-cyan-400 ring-4 ring-cyan-400/10" />{index < (incidentReplay.timeline.length - 1) && <span className="mt-1 h-full w-px bg-slate-800" />}</div><div className="pb-2"><p className="text-xs font-semibold text-slate-200">{event.event_message}</p><p className="mt-1 text-[10px] text-slate-600">{event.event_type.replaceAll("_", " ")} · {new Date(event.event_timestamp).toLocaleString()}</p></div></div>)}</div> : <p className="text-xs text-slate-500">{incidentReplay ? "No timeline events recorded." : "Loading incident timeline…"}</p>}</div>
+                </> : <div className="grid min-h-48 place-items-center text-center text-sm text-slate-600">Choose an incident to inspect its timeline and actions.</div>}
+              </Panel>
+            </div>
+          )}
 
-        {/* Last Metrics Update */}
-        <div className="mt-6 rounded-xl border border-slate-800 bg-slate-900 p-6">
+          {tab === "ml" && (
+            <div className="space-y-5">
+              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+                <MetricCard label="Model state" value={ml?.is_trained ? "Active" : "Pending"} note={`Isolation Forest · v${ml?.model_version ?? "—"}`} accent="bg-violet-400" icon="✳" />
+                <MetricCard label="Training samples" value={ml?.training_samples == null ? "—" : String(ml.training_samples)} note="Samples used by the currently loaded artifact" accent="bg-blue-400" icon="▥" />
+                <MetricCard label="Evaluations" value={String(ml?.detection_count ?? 0)} note="Stored model predictions" accent="bg-cyan-400" icon="⌁" />
+                <MetricCard label="Anomaly signals" value={String(ml?.anomaly_count ?? 0)} note="Predictions classified as anomalous" accent="bg-rose-400" icon="⚠" />
+              </div>
+              <div className="grid gap-4 xl:grid-cols-[1fr_1.3fr]">
+                <Panel>
+                  <SectionTitle eyebrow="Model transparency" title="Model health" description="The anomaly score is a decision-function score, not a probability." action={<Pill tone={ml?.is_trained ? "green" : "amber"}>{ml?.is_trained ? "Trained" : "Training required"}</Pill>} />
+                  <div className="space-y-4 text-xs">
+                    <div className="flex justify-between border-b border-slate-800 pb-3"><span className="text-slate-500">Algorithm</span><span className="font-medium text-slate-200">Isolation Forest</span></div>
+                    <div className="flex justify-between border-b border-slate-800 pb-3"><span className="text-slate-500">Model version</span><span className="font-mono text-slate-200">{ml?.model_version ?? "—"}</span></div>
+                    <div className="flex justify-between border-b border-slate-800 pb-3"><span className="text-slate-500">Training date</span><span className="text-right text-slate-200">{ml?.trained_at ? new Date(ml.trained_at).toLocaleString() : "Not recorded"}</span></div>
+                    <div className="flex justify-between border-b border-slate-800 pb-3"><span className="text-slate-500">Features</span><span className="text-right text-slate-200">CPU · Memory · Disk</span></div>
+                  </div>
+                  <button disabled={busy || !token} onClick={() => void retrainModel()} className="mt-5 w-full rounded-xl bg-violet-500/15 px-4 py-3 text-xs font-semibold text-violet-200 transition hover:bg-violet-500/25 disabled:cursor-not-allowed disabled:opacity-40">{busy ? "Working…" : "↻ Retrain on latest 7-day history"}</button>
+                  {!token && <p className="mt-2 text-center text-[10px] text-slate-600">Analyst or admin sign-in required.</p>}
+                  {thresholdSaved && <p className="mt-3 text-xs text-emerald-300">{thresholdSaved}</p>}
+                </Panel>
+                <Panel>
+                  <SectionTitle eyebrow="Recent predictions" title="Anomaly history" description="Recent model results with their decision scores." />
+                  {anomalies.length ? <div className="overflow-x-auto"><table className="w-full min-w-[520px] text-left text-xs"><thead className="text-[10px] uppercase tracking-wider text-slate-500"><tr><th className="pb-3">Result</th><th className="pb-3">Instance</th><th className="pb-3">Score</th><th className="pb-3">Metric ID</th><th className="pb-3">Detected</th></tr></thead><tbody>{anomalies.map((anomaly) => <tr key={anomaly.id} className="border-t border-slate-800"><td className="py-3"><Pill tone={anomaly.is_anomaly ? "red" : "green"}>{anomaly.is_anomaly ? "Anomaly" : "Normal"}</Pill></td><td className="py-3 font-mono text-slate-300">{anomaly.instance_id}</td><td className="py-3 font-mono">{anomaly.anomaly_score.toFixed(5)}</td><td className="py-3 text-slate-400">{anomaly.metric_id}</td><td className="py-3 text-slate-500">{new Date(anomaly.detected_at).toLocaleString()}</td></tr>)}</tbody></table></div> : <p className="text-sm text-slate-500">No anomaly predictions stored yet.</p>}
+                  <p className="mt-4 text-[10px] leading-5 text-slate-600">Anomaly classifications depend on the training data. A small or narrow dataset is suitable for a demonstration, not proof of production-grade detection accuracy.</p>
+                </Panel>
+              </div>
+              <Panel>
+                <SectionTitle eyebrow="Optimization" title="Cost & resource intelligence" description="Utilization-based recommendations. Dollar savings are not estimated without live pricing and billing inputs." />
+                {costRecommendations.length ? <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">{costRecommendations.map((item) => <div key={item.instance_id} className="rounded-xl border border-slate-800 bg-slate-950/60 p-4"><div className="flex items-center justify-between gap-2"><p className="truncate text-xs font-semibold text-white">{item.instance_id}</p><Pill tone={item.status === "underutilized" ? "amber" : item.status === "healthy" ? "green" : "slate"}>{item.status.replaceAll("_", " ")}</Pill></div><p className="mt-3 text-xs text-slate-400">Avg CPU {item.average_cpu_percent}% · Peak {item.peak_cpu_percent}%</p><p className="text-xs text-slate-400">Avg memory {item.average_memory_percent}% · Peak {item.peak_memory_percent}%</p><p className="mt-3 text-xs leading-5 text-slate-500">{item.reason}</p><p className="mt-2 text-[10px] font-bold uppercase tracking-wider text-cyan-300">{item.recommended_action.replaceAll("_", " ")}</p><p className="mt-2 text-[10px] text-slate-600">{item.sample_count} samples</p></div>)}</div> : <p className="text-sm text-slate-500">No recommendations yet. Additional metric history is needed.</p>}
+              </Panel>
+            </div>
+          )}
 
-          <h2 className="text-lg font-semibold">
-            Last Metrics Update
-          </h2>
+          {tab === "settings" && (
+            <div className="grid gap-5 xl:grid-cols-[1fr_1.1fr]">
+              <Panel>
+                <SectionTitle eyebrow="Alert policy" title="Resource thresholds" description="Warning and critical limits are applied to new metric collections." />
+                <form onSubmit={saveThresholds} className="space-y-4">
+                  <div className="grid grid-cols-[1fr_1fr_1fr] gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-500"><span>Metric</span><span>Warning %</span><span>Critical %</span></div>
+                  {(["cpu", "memory", "disk"] as (keyof Thresholds)[]).map((metric) => <div key={metric} className="grid grid-cols-[1fr_1fr_1fr] items-center gap-2"><span className="text-sm font-medium capitalize text-slate-200">{metric}</span><input type="number" min="1" max="99" step="0.5" value={thresholds[metric].warning} onChange={(event) => updateThreshold(metric, "warning", event.target.value)} className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white outline-none focus:border-cyan-400" /><input type="number" min="2" max="100" step="0.5" value={thresholds[metric].critical} onChange={(event) => updateThreshold(metric, "critical", event.target.value)} className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white outline-none focus:border-cyan-400" /></div>)}
+                  <button disabled={busy || user?.role !== "admin"} className="w-full rounded-xl bg-cyan-400 px-4 py-3 text-xs font-bold text-slate-950 disabled:cursor-not-allowed disabled:opacity-40">Save threshold policy</button>
+                  {user?.role !== "admin" && <p className="text-[10px] text-slate-600">Administrator sign-in required to modify alert policy.</p>}
+                  {thresholdSaved && <p className="text-xs text-emerald-300">{thresholdSaved}</p>}
+                </form>
+              </Panel>
+              <Panel>
+                <SectionTitle eyebrow="Outbound delivery" title="Notification activity" description="Delivery attempts are logged for SNS, email and Slack, including skipped/unconfigured channels." />
+                {notifications.length ? <div className="space-y-2">{notifications.map((notification) => <div key={notification.id} className="flex flex-wrap items-center gap-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3"><div className="grid h-8 w-8 place-items-center rounded-lg bg-slate-800 text-xs font-bold uppercase text-slate-300">{notification.channel.slice(0, 2)}</div><div className="min-w-0 flex-1"><p className="text-xs font-semibold capitalize text-slate-200">{notification.channel} · incident {notification.incident_id ?? "—"}</p><p className="mt-1 text-[10px] text-slate-500">{notification.instance_id ?? "unknown instance"} · {new Date(notification.created_at).toLocaleString()}</p></div><Pill tone={notification.status === "sent" ? "green" : notification.status === "failed" ? "red" : "slate"}>{notification.status}</Pill></div>)}</div> : <p className="text-sm text-slate-500">No notification attempts have been recorded yet.</p>}
+                <div className="mt-5 rounded-xl border border-slate-800 bg-slate-950/50 p-4"><p className="text-xs font-semibold text-slate-300">Provider configuration</p><p className="mt-2 text-xs leading-5 text-slate-500">Set SMTP variables for email, SLACK_WEBHOOK_URL for Slack, and CLOUDPULSE_SNS_TOPIC_ARN for SNS in the backend environment. Secrets are never returned to this dashboard.</p></div>
+              </Panel>
+            </div>
+          )}
 
-          <p className="mt-3 text-slate-400">
-            {data
-              ? new Date(
-                  data.latest_metrics.timestamp
-                ).toLocaleString()
-              : "Loading..."}
-          </p>
-
-        </div>
-
+          <footer className="mt-8 flex flex-col justify-between gap-2 border-t border-slate-800/80 pt-4 text-[10px] text-slate-600 sm:flex-row"><span>CloudPulse Sentinel · Intelligent cloud operations</span><span>Data refresh: {lastRefresh ? new Date(lastRefresh).toLocaleTimeString() : "waiting"} · {refreshRate ? `${refreshRate / 1000}s polling` : "manual polling"}</span></footer>
+        </section>
       </div>
     </main>
   );

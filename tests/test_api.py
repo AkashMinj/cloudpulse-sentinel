@@ -15,7 +15,7 @@ def test_root():
     assert response.json() == {
         "service": "CloudPulse Sentinel",
         "status": "running",
-        "version": "0.8.0",
+        "version": "0.9.0",
     }
 
 
@@ -35,7 +35,7 @@ def test_metrics_history_limit_validation():
 
 
 def test_metrics_history_limit_upper_bound():
-    response = client.get("/api/v1/metrics/history?limit=201")
+    response = client.get("/api/v1/metrics/history?limit=501")
 
     assert response.status_code == 422
 
@@ -291,3 +291,72 @@ def test_metrics_collect_updates_existing_incident_severity():
     assert update_params[1] == "critical"
     assert update_params[5] == 95  # Critical threshold
     assert update_params[6] == 42  # Existing incident ID
+
+
+def test_metrics_ingest_rejects_missing_or_invalid_token(monkeypatch):
+    monkeypatch.setenv("METRICS_INGEST_TOKEN", "t" * 40)
+    payload = {
+        "instance_id": "i-demo-instance",
+        "cpu_usage_percent": 25,
+        "memory_usage_percent": 50,
+        "disk_usage_percent": 35,
+    }
+    response = client.post("/api/v1/metrics/ingest", json=payload)
+    assert response.status_code == 401
+
+    response = client.post(
+        "/api/v1/metrics/ingest",
+        json=payload,
+        headers={"X-Metrics-Token": "wrong-token"},
+    )
+    assert response.status_code == 401
+
+
+def test_ml_training_route_is_registered_once():
+    matching = [
+        route for route in app.routes
+        if getattr(route, "path", None) == "/api/v1/ml/train"
+        and "POST" in getattr(route, "methods", set())
+    ]
+    assert len(matching) == 1
+
+
+def test_metrics_ingest_accepts_valid_token_and_persists_instance_metrics(monkeypatch):
+    monkeypatch.setenv("METRICS_INGEST_TOKEN", "r" * 40)
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (777,)
+    mock_cursor.fetchall.return_value = []
+
+    mock_connection = MagicMock()
+    mock_connection.cursor.return_value = mock_cursor
+
+    payload = {
+        "instance_id": "i-cloudpulse-test",
+        "cpu_usage_percent": 32.5,
+        "memory_usage_percent": 48.0,
+        "disk_usage_percent": 41.0,
+        "cpu_count": 2,
+        "memory_total_gb": 8.0,
+        "memory_available_gb": 4.0,
+        "disk_total_gb": 30.0,
+        "disk_free_gb": 17.7,
+    }
+
+    with patch("app.main.get_db_connection", return_value=mock_connection), \
+         patch("app.main.ml_service.is_trained", False), \
+         patch("app.main.metrics_archive_service.archive_metric") as archive, \
+         patch("app.main.publish_metric_event") as publish:
+        response = client.post(
+            "/api/v1/metrics/ingest",
+            json=payload,
+            headers={"X-Metrics-Token": "r" * 40},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["metric_id"] == 777
+    assert response.json()["instance_id"] == "i-cloudpulse-test"
+    assert response.json()["incidents_created"] == 0
+    mock_connection.commit.assert_called_once()
+    mock_connection.close.assert_called_once()
+    archive.assert_called_once()
+    publish.assert_called_once()

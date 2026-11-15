@@ -175,6 +175,8 @@ def test_save_model_uploads_artifact_to_s3():
         ]
     )
 
+    service.training_samples = 20
+    service.trained_at = "2026-11-15T00:00:00+00:00"
     service._save_model(detector)
 
     kwargs = service.s3_client.put_object.call_args.kwargs
@@ -185,6 +187,8 @@ def test_save_model_uploads_artifact_to_s3():
     assert artifact["model_version"] == service.model_version
     assert isinstance(artifact["detector"], ResourceAnomalyDetector)
     assert artifact["detector"]._trained
+    assert artifact["training_samples"] == 20
+    assert artifact["trained_at"] == "2026-11-15T00:00:00+00:00"
 
 
 def test_load_model_restores_saved_detector():

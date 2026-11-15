@@ -1,2 +1,4 @@
 -r app/requirements.txt
+pytest
+httpx
 pip-audit

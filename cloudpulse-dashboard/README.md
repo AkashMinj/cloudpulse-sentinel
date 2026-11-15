@@ -1,36 +1,32 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# CloudPulse Sentinel Dashboard
 
-## Getting Started
+Responsive Next.js operations console for CloudPulse Sentinel.
 
-First, run the development server:
+## Setup
 
 ```bash
+npm ci
+cp .env.example .env.local
+vim .env.local
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Set `BACKEND_URL` to the FastAPI service URL. For local development, use `http://localhost:8000` while the backend is reachable locally or through an SSH tunnel. Docker Compose publishes the dashboard at `http://localhost:3001`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Dashboard sections
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- **Overview:** health indicator, active incidents, monitored instances, historical CPU/memory/disk charts, refresh controls and instance filtering.
+- **Incidents:** severity/status filters, event timeline, acknowledgement and resolution actions.
+- **ML & Cost:** model version/state, training metadata, anomaly score history and utilization recommendations.
+- **Settings:** admin-managed resource thresholds and SNS/email/Slack delivery history.
 
-## Learn More
+Read-only views work without signing in. Incident actions and model retraining require an analyst/admin session. Threshold editing requires an admin session.
 
-To learn more about Next.js, take a look at the following resources:
+## Checks
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```bash
+npm run lint
+npm run build
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+The dashboard displays API-backed data. A missing provider integration is shown as skipped/unconfigured rather than simulated as a successful notification.

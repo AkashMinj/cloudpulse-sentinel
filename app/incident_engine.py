@@ -25,31 +25,32 @@ THRESHOLDS = {
 # INCIDENT DETECTION
 # -------------------------
 
-def detect_incidents(metrics):
+def detect_incidents(metrics, thresholds=None):
     """
     Evaluate system metrics and return detected incidents.
     """
 
     incidents = []
+    configured_thresholds = thresholds or THRESHOLDS
 
     checks = [
         {
             "type": "high_cpu",
             "metric_name": "CPU usage",
             "value": metrics["cpu_usage_percent"],
-            "thresholds": THRESHOLDS["cpu"],
+            "thresholds": configured_thresholds["cpu"],
         },
         {
             "type": "high_memory",
             "metric_name": "Memory usage",
             "value": metrics["memory_usage_percent"],
-            "thresholds": THRESHOLDS["memory"],
+            "thresholds": configured_thresholds["memory"],
         },
         {
             "type": "high_disk",
             "metric_name": "Disk usage",
             "value": metrics["disk_usage_percent"],
-            "thresholds": THRESHOLDS["disk"],
+            "thresholds": configured_thresholds["disk"],
         },
     ]
 

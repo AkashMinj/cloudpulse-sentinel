@@ -96,3 +96,26 @@ def test_incident_contains_required_fields():
     assert incident["threshold_value"] == 80
     assert "description" in incident
     assert "detected_at" in incident
+
+
+def test_custom_thresholds_are_applied():
+    thresholds = {
+        "cpu": {"warning": 60, "critical": 90},
+        "memory": {"warning": 70, "critical": 92},
+        "disk": {"warning": 75, "critical": 94},
+    }
+    incidents = detect_incidents(make_metrics(cpu=65, memory=72, disk=50), thresholds)
+    assert [item["incident_type"] for item in incidents] == ["high_cpu", "high_memory"]
+    assert incidents[0]["threshold_value"] == 60
+    assert incidents[1]["threshold_value"] == 70
+
+
+def test_custom_critical_threshold_changes_severity():
+    thresholds = {
+        "cpu": {"warning": 60, "critical": 85},
+        "memory": {"warning": 80, "critical": 95},
+        "disk": {"warning": 80, "critical": 95},
+    }
+    incidents = detect_incidents(make_metrics(cpu=87), thresholds)
+    assert incidents[0]["severity"] == "critical"
+    assert incidents[0]["threshold_value"] == 85

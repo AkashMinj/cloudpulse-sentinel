@@ -141,3 +141,52 @@ ON CONFLICT (username) DO NOTHING;
 
 -- Success message
 SELECT 'CloudPulse Sentinel database schema initialized successfully!' AS status;
+
+-- Remediation actions table for audit trail (NEW)
+CREATE TABLE IF NOT EXISTS remediation_actions (
+    id SERIAL PRIMARY KEY,
+    incident_id INTEGER NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    action VARCHAR(100) NOT NULL,
+    approved_by VARCHAR(100) NOT NULL,
+    executed_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    result JSONB,
+    status VARCHAR(50) DEFAULT 'pending',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_remediation_actions_incident_id ON remediation_actions(incident_id);
+CREATE INDEX IF NOT EXISTS idx_remediation_actions_executed_at ON remediation_actions(executed_at DESC);
+
+
+-- Runtime-upgrade tables and additive incident metadata.
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS acknowledged_by VARCHAR(100);
+
+CREATE TABLE IF NOT EXISTS monitoring_thresholds (
+    metric_name VARCHAR(20) PRIMARY KEY CHECK (metric_name IN ('cpu', 'memory', 'disk')),
+    warning_threshold NUMERIC(5,2) NOT NULL,
+    critical_threshold NUMERIC(5,2) NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by VARCHAR(100),
+    CHECK (warning_threshold >= 1 AND warning_threshold <= 99),
+    CHECK (critical_threshold >= 2 AND critical_threshold <= 100),
+    CHECK (warning_threshold < critical_threshold)
+);
+
+INSERT INTO monitoring_thresholds (metric_name, warning_threshold, critical_threshold)
+VALUES ('cpu', 80, 95), ('memory', 80, 95), ('disk', 80, 95)
+ON CONFLICT (metric_name) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS notification_history (
+    id BIGSERIAL PRIMARY KEY,
+    incident_id INTEGER REFERENCES incidents(id) ON DELETE SET NULL,
+    instance_id VARCHAR(255),
+    channel VARCHAR(30) NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    provider_reference VARCHAR(255),
+    details JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_notification_history_created_at ON notification_history(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notification_history_incident_id ON notification_history(incident_id);
+CREATE INDEX IF NOT EXISTS idx_incidents_acknowledged_at ON incidents(acknowledged_at);
