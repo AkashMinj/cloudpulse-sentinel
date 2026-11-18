@@ -141,12 +141,18 @@ PY
             }
         }
 
-
         stage('Dashboard Checks') {
             steps {
                 sh '''
                     set -eu
+
+                    JENKINS_UID="$(id -u)"
+                    JENKINS_GID="$(id -g)"
+
                     docker run --rm \
+                        --user "${JENKINS_UID}:${JENKINS_GID}" \
+                        -e HOME=/tmp \
+                        -e npm_config_cache=/tmp/.npm \
                         -v "$PWD/cloudpulse-dashboard:/workspace" \
                         -w /workspace \
                         node:22-alpine \
@@ -154,6 +160,7 @@ PY
                 '''
             }
         }
+
 
         stage('Docker Build') {
             steps {
