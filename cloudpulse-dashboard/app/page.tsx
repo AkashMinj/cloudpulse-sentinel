@@ -224,10 +224,20 @@ export default function Home() {
   }, [instanceFilter]);
 
   useEffect(() => {
-    void loadDashboard();
-    if (refreshRate === 0) return;
+    const initialLoad = window.setTimeout(() => {
+      void loadDashboard();
+    }, 0);
+
+    if (refreshRate === 0) {
+      return () => window.clearTimeout(initialLoad);
+    }
+
     const timer = window.setInterval(() => void loadDashboard(), refreshRate);
-    return () => window.clearInterval(timer);
+
+    return () => {
+      window.clearTimeout(initialLoad);
+      window.clearInterval(timer);
+    };
   }, [loadDashboard, refreshRate]);
 
   const openIncident = async (incident: Incident) => {
