@@ -358,12 +358,75 @@ export default function Home() {
     }
   };
 
-  const chartData = useMemo(() => [...history].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()).map((metric) => ({
-    time: new Date(metric.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-    cpu: metric.cpu_usage_percent,
-    memory: metric.memory_usage_percent,
-    disk: metric.disk_usage_percent,
-  })), [history]);
+  const chartInstances = useMemo(
+    () => [...new Set(history.map((metric) => metric.instance_id))].sort(),
+    [history],
+  );
+
+  const chartSeries = useMemo(() => {
+    const resources = [
+      { key: "cpu", label: "CPU", colorIndex: 0 },
+      { key: "memory", label: "Memory", colorIndex: 1 },
+      { key: "disk", label: "Disk", colorIndex: 2 },
+    ] as const;
+
+    const instancePalettes = [
+      ["#22d3ee", "#818cf8", "#34d399"],
+      ["#fb923c", "#c084fc", "#facc15"],
+      ["#f472b6", "#60a5fa", "#a3e635"],
+      ["#f87171", "#2dd4bf", "#e879f9"],
+      ["#a78bfa", "#fb7185", "#38bdf8"],
+    ];
+
+    return chartInstances.flatMap((instanceId, instanceIndex) => {
+      const palette = instancePalettes[instanceIndex % instancePalettes.length];
+      const displayName =
+        instanceId === "local-docker"
+          ? "Local Docker"
+          : instanceId.startsWith("i-")
+            ? `EC2 ${instanceId.slice(-5)}`
+            : instanceId;
+
+      return resources.map((resource) => ({
+        dataKey: `instance_${instanceIndex}_${resource.key}`,
+        name: `${displayName} · ${resource.label}`,
+        stroke: palette[resource.colorIndex],
+      }));
+    });
+  }, [chartInstances]);
+
+  const chartData = useMemo(() => {
+    const instanceIndexes = new Map(
+      chartInstances.map((instanceId, index) => [instanceId, index] as const),
+    );
+
+    return [...history]
+      .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
+      .map((metric) => {
+        const row: Record<string, string | number | null> = {
+          time: new Date(metric.timestamp).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          }),
+        };
+
+        chartInstances.forEach((_, index) => {
+          row[`instance_${index}_cpu`] = null;
+          row[`instance_${index}_memory`] = null;
+          row[`instance_${index}_disk`] = null;
+        });
+
+        const instanceIndex = instanceIndexes.get(metric.instance_id);
+
+        if (instanceIndex !== undefined) {
+          row[`instance_${instanceIndex}_cpu`] = metric.cpu_usage_percent;
+          row[`instance_${instanceIndex}_memory`] = metric.memory_usage_percent;
+          row[`instance_${instanceIndex}_disk`] = metric.disk_usage_percent;
+        }
+
+        return row;
+      });
+  }, [history, chartInstances]);
 
   const current = summary?.latest_metrics;
   const healthScore = current
@@ -489,9 +552,19 @@ export default function Home() {
                       <YAxis domain={[0, 100]} tick={{ fill: "#64748b", fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={(value) => `${value}%`} />
                       <Tooltip contentStyle={{ background: "#0b1220", border: "1px solid #334155", borderRadius: 12, color: "#e2e8f0" }} formatter={(value) => [`${Number(value).toFixed(1)}%`]} />
                       <Legend wrapperStyle={{ color: "#94a3b8", fontSize: 11 }} />
-                      <Line type="monotone" dataKey="cpu" name="CPU" stroke="#22d3ee" strokeWidth={2.5} dot={false} activeDot={{ r: 4 }} />
-                      <Line type="monotone" dataKey="memory" name="Memory" stroke="#818cf8" strokeWidth={2.5} dot={false} activeDot={{ r: 4 }} />
-                      <Line type="monotone" dataKey="disk" name="Disk" stroke="#34d399" strokeWidth={2.5} dot={false} activeDot={{ r: 4 }} />
+                      {chartSeries.map((series) => (
+                        <Line
+                          key={series.dataKey}
+                          type="monotone"
+                          dataKey={series.dataKey}
+                          name={series.name}
+                          stroke={series.stroke}
+                          strokeWidth={2.5}
+                          dot={false}
+                          activeDot={{ r: 4 }}
+                          connectNulls
+                        />
+                      ))}
                     </LineChart></ResponsiveContainer> : <div className="grid h-full place-items-center rounded-xl border border-dashed border-slate-800 text-sm text-slate-500">No metric history yet. Collect metrics or connect an instance agent.</div>}
                   </div>
                 </Panel>
